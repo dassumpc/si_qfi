@@ -14,11 +14,24 @@ Supported model strings
 All keys that are not recognised model parameters are passed through as kwargs
 to the model constructor so that future models can add their own parameters
 without changes here.
+
+Gain convention check (PRD §3.6)
+---------------------------------
+The SI schematic is the sole source of a device's linear gain; nonlinear
+node models should be normalized to unity small-signal gain (see
+nonlinear/base.py). After building each node, build_nonlinear_nodes() checks
+node.small_signal_gain and warns if it deviates from unity by more than
+_SMALL_SIGNAL_GAIN_TOLERANCE_DB — a likely sign the device's real gain was
+fit directly into the nonlinear model and will be double-counted if that
+device is also represented in the schematic.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import warnings
+from typing import Any, Optional
+
+import numpy as np
 
 from .base import NonlinearNode
 from .saleh import SalehModel
@@ -26,10 +39,13 @@ from .amam_ampm import TabulatedAMAM
 from .memory_polynomial import MemoryPolynomial
 from .volterra import VolterraModel
 
+_SMALL_SIGNAL_GAIN_TOLERANCE_DB = 3.0
+
 
 def build_nonlinear_nodes(
     nonlinear_annotation: dict[str, dict[str, Any]],
     mode: str,
+    warnings_list: Optional[list[str]] = None,
 ) -> dict[str, NonlinearNode]:
     """
     Parse the nonlinear_nodes annotation dict and instantiate model objects.
@@ -42,6 +58,11 @@ def build_nonlinear_nodes(
     mode : str
         'complex_baseband' or 'real_axis'. Used to validate that the selected
         model supports the chosen simulation mode.
+    warnings_list : list of str, optional
+        If given, gain-convention warnings (see module docstring) are
+        appended here instead of being emitted immediately via
+        warnings.warn() — used by the engine to collect all diagnostics
+        together. If None, warnings.warn() is called directly.
 
     Returns
     -------
@@ -59,9 +80,41 @@ def build_nonlinear_nodes(
             raise ValueError(f"Nonlinear node '{label}' has no 'model' key.")
 
         node = _build_model(label, model_name, spec, mode)
+        _check_small_signal_gain(label, node, warnings_list)
         nodes[label] = node
 
     return nodes
+
+
+def _check_small_signal_gain(
+    label: str,
+    node: NonlinearNode,
+    warnings_list: Optional[list[str]],
+) -> None:
+    """
+    Warn if a built node's small-signal gain deviates materially from unity.
+
+    See "Gain convention check" in the module docstring.
+    """
+    gain = node.small_signal_gain
+    if gain is None or gain <= 0:
+        return
+    gain_db = 20.0 * np.log10(gain)
+    if abs(gain_db) > _SMALL_SIGNAL_GAIN_TOLERANCE_DB:
+        msg = (
+            f"Nonlinear node '{label}' has small-signal gain {gain_db:+.1f} dB "
+            f"relative to unity (expected ~0 dB). Per the SI-QFI gain "
+            f"convention (PRD §3.6), a device's linear gain should be "
+            f"captured by the SI schematic (e.g. a small-signal S-parameter "
+            f"block), and this nonlinear model should represent only the "
+            f"amplitude-dependent deviation from that response. If this "
+            f"device is also present in the schematic, its gain is likely "
+            f"being applied twice."
+        )
+        if warnings_list is not None:
+            warnings_list.append(msg)
+        else:
+            warnings.warn(f"SI-QFI: {msg}", stacklevel=3)
 
 
 def _build_model(

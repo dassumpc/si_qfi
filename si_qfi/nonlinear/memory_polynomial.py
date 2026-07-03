@@ -28,6 +28,18 @@ Option B — From P1dB / IP3: SI-QFI sets the k=1 coefficients from small-signal
            gain and the k=3 coefficients from the cubic describing-function result
            (PRD §5.1). Coefficients for m>0 taps are set to zero (memoryless seed).
            The user then optionally modifies off-diagonal taps to add memory.
+
+Gain convention (PRD §3.6)
+---------------------------
+The k=1, m=0 coefficient a_{1,0} is this model's small-signal gain and should
+be ≈ 1.0: the device's linear gain belongs in the SI schematic (small-signal
+S-parameter block), and this model should apply only the amplitude-dependent
+deviation from that response. `from_p1db_ip3()` defaults `small_signal_gain=
+1.0` for this reason. Coefficients fit directly from full device measurements
+(e.g. via `from_saleh()` on an unnormalized Saleh fit) will instead carry the
+device's real gain — if that device is also in the schematic, this
+double-counts its gain. `siq.run()` warns if a_{1,0} deviates from 1.0 by
+more than ~3 dB.
 """
 
 from __future__ import annotations
@@ -173,6 +185,18 @@ class MemoryPolynomial(NonlinearNode):
     @property
     def supports_real_axis(self) -> bool:
         return False
+
+    @property
+    def small_signal_gain(self) -> Optional[float]:
+        """
+        Magnitude of the linear (k=1, m=0) coefficient, if order 1 is
+        present. Should be ≈1.0 — see module docstring. Returns None if
+        order 1 is not among the modeled orders.
+        """
+        if 1 not in self._orders:
+            return None
+        row = self._orders.index(1)
+        return float(abs(self._coefficients[row, 0]))
 
     # ------------------------------------------------------------------
     # Core application

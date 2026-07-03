@@ -23,6 +23,17 @@ For a cubic polynomial f(x) = x + c·x³ (c < 0 for compression):
 Saleh parameters can be fit from P1dB + IP3 via convenience constructor
 `SalehModel.from_p1db_ip3()`, or from measured power-in/power-out data via
 `SalehModel.fit()`.
+
+Gain convention (PRD §3.6)
+---------------------------
+alpha_a is the model's small-signal gain and should be ≈ 1.0: the amplifier's
+actual linear gain belongs in the SI schematic (as a small-signal S-parameter
+block), and this model supplies only the amplitude-dependent compression on
+top of it. `from_p1db_ip3()` defaults `small_signal_gain=1.0` for this reason.
+`fit()` on raw measured amp_in/amp_out data will instead recover the device's
+real gain as alpha_a — if that same device is also in the schematic, this
+double-counts its gain. `siq.run()` warns if alpha_a deviates from 1.0 by
+more than ~3 dB.
 """
 
 from __future__ import annotations
@@ -41,7 +52,8 @@ class SalehModel(NonlinearNode):
     Parameters
     ----------
     alpha_a, beta_a : float
-        AM-AM Saleh parameters. alpha_a ≈ small-signal gain.
+        AM-AM Saleh parameters. alpha_a is the small-signal gain and should
+        be ≈ 1.0 under the SI-QFI gain convention — see module docstring.
     alpha_phi, beta_phi : float
         AM-PM Saleh parameters. Set alpha_phi=0 to disable AM-PM.
     """
@@ -216,6 +228,11 @@ class SalehModel(NonlinearNode):
     @property
     def supports_real_axis(self) -> bool:
         return False
+
+    @property
+    def small_signal_gain(self) -> float:
+        """G[A] as A → 0, i.e. alpha_a. Should be ≈1.0 — see module docstring."""
+        return self.alpha_a
 
     def apply_baseband(self, u: np.ndarray) -> np.ndarray:
         """

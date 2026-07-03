@@ -18,9 +18,28 @@ Option B — Full kernel (h₁ + h₃, h₂=0 for odd-symmetric amplifiers):
     Note: full 3-D kernel storage is O(M³) — keep M small (≤ 20).
 
 Option C — Describing function parameterisation (default):
-    h₁ is supplied from the SI transfer function (set externally by the engine).
-    h₃ is a diagonal approximation derived from P1dB and IP3 (odd-symmetric).
-    This is the practical default when only P1dB/IP3 measurements are available.
+    The k=1, m=0 diagonal coefficient stands in for h₁ (see gain convention
+    below); h₃ is a diagonal approximation derived from P1dB and IP3
+    (odd-symmetric). This is the practical default when only P1dB/IP3
+    measurements are available. NOTE: h1/set_h1() has no effect for this
+    option or for 'diagonal' — both dispatch to _apply_diagonal(), which
+    only reads self._coeff. h1 is used only by option='full_kernel'.
+
+Gain convention (PRD §3.6)
+---------------------------
+A device's linear gain (and, for 'full_kernel', its linear filtering shape)
+belongs in the SI schematic, not in this model — the engine already
+convolves the signal with the schematic's segment transfer function before
+and after this node. Consequently:
+  - 'diagonal' / 'describing': the k=1, m=0 coefficient (small_signal_gain,
+    default 1.0) should stay ≈1.0.
+  - 'full_kernel': h1 should remain the default unit impulse [1.0] (identity)
+    unless intentionally modeling *additional* dispersion beyond what the
+    schematic's own transfer function already captures — setting h1 to a
+    copy of that same segment transfer function would double-apply it.
+`siq.run()` warns if the diagonal small_signal_gain deviates from 1.0 by
+more than ~3 dB (not checked for 'full_kernel', where gain is embedded in
+an array rather than a scalar).
 """
 
 from __future__ import annotations
@@ -39,10 +58,12 @@ class VolterraModel(NonlinearNode):
     Parameters
     ----------
     h1 : np.ndarray, float64, shape (L1,)
-        First-order (linear) kernel — impulse response. Usually set from the
-        SI transfer function by the simulation engine. If None, h1 = delta[0]
-        (no linear filtering within the NL block itself; the linear channel is
-        applied by the engine before and after).
+        First-order (linear) kernel — used only by option='full_kernel'
+        (see module docstring; ignored by 'diagonal' and 'describing').
+        Defaults to delta[0] (identity): the linear channel response is
+        already applied by the engine's own segment convolution, so h1
+        should not duplicate it — see gain convention in the module
+        docstring.
     option : str
         'diagonal'    — diagonal kernel; requires coefficients.
         'full_kernel' — full h3 tensor; requires h3.
@@ -191,6 +212,19 @@ class VolterraModel(NonlinearNode):
     @property
     def supports_real_axis(self) -> bool:
         return True
+
+    @property
+    def small_signal_gain(self) -> Optional[float]:
+        """
+        Linear (k=1, m=0) diagonal coefficient for 'diagonal'/'describing'.
+        Should be ≈1.0 — see module docstring. Returns None for
+        'full_kernel', where gain is embedded in the h1 array rather than a
+        scalar.
+        """
+        if self._option in ("diagonal", "describing") and 1 in self._orders:
+            row = self._orders.index(1)
+            return float(self._coeff[row, 0])
+        return None
 
     def apply_real_axis(self, v: np.ndarray) -> np.ndarray:
         """

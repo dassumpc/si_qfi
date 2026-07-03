@@ -130,7 +130,10 @@ def run(
     # ------------------------------------------------------------------
     # Build nonlinear node objects
     # ------------------------------------------------------------------
-    nl_nodes = build_nonlinear_nodes(nonlinear, mode) if nonlinear else {}
+    nl_nodes = (
+        build_nonlinear_nodes(nonlinear, mode, warnings_list=sim_warnings)
+        if nonlinear else {}
+    )
 
     # ------------------------------------------------------------------
     # SETUP: Extract transfer functions

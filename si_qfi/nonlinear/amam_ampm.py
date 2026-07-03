@@ -9,6 +9,17 @@ required — this is the most faithful representation of a real measured amplifi
 
 The describing function justification (PRD §5.1) guarantees that this model
 is exact under the narrowband + harmonic-filtering assumptions.
+
+Gain convention (PRD §3.6)
+---------------------------
+The amp_out/amp_in curve should approach unity slope as amp_in → 0: the
+device's linear gain belongs in the SI schematic (small-signal S-parameter
+block), and this table should describe only the amplitude-dependent
+deviation from that response. A curve taken directly from a full device
+measurement (gain included) will instead have a small-signal slope equal to
+the device's real gain — if that device is also in the schematic, this
+double-counts its gain. `siq.run()` warns if small_signal_gain deviates from
+1.0 by more than ~3 dB.
 """
 
 from __future__ import annotations
@@ -114,6 +125,14 @@ class TabulatedAMAM(NonlinearNode):
     @property
     def supports_real_axis(self) -> bool:
         return False
+
+    @property
+    def small_signal_gain(self) -> float:
+        """
+        AM-AM slope at the lowest tabulated amplitude, as an estimate of the
+        curve's linear gain. Should be ≈1.0 — see module docstring.
+        """
+        return float(self._amam_spline(self._amp_in[0], 1))
 
     def apply_baseband(self, u: np.ndarray) -> np.ndarray:
         """

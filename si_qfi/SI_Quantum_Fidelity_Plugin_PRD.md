@@ -1,5 +1,5 @@
 # SI-QFI: Signal Integrity Quantum Fidelity Impact Plugin
-### Project Definition Document v0.4
+### Project Definition Document v0.5
 
 ---
 
@@ -58,6 +58,30 @@ For each segment between adjacent probes, SI-QFI extracts the voltage transfer f
 
 Propagation order is determined by tracing signal flow from the voltage source to `QUBIT_PROBE`. If topology is ambiguous, SI-QFI raises an error.
 
+### 3.6 Linear/Nonlinear Gain Split Convention
+
+**The SI schematic is the sole source of a device's linear (small-signal) gain, phase, and frequency response — including active devices.** SignalIntegrity performs generic linear network analysis and can import an active device's measured or datasheet small-signal S-parameters (e.g. an amplifier's low-power S2P file) exactly as it would a passive component; the device does not need to be passive or reciprocal. When a nonlinear element such as an amplifier appears in the drive chain:
+
+1. Import its small-signal (linear, low-power) S-parameters as a block in the SI schematic.
+2. Place the `NL_<name>` probe at that device's physical output node.
+3. Configure the corresponding nonlinear model (§5) to represent **only the amplitude-dependent deviation** from that already-captured linear response — not the device's gain itself.
+
+**Every nonlinear node model must therefore be normalized to unity small-signal gain**: as input amplitude A → 0, the model's output must satisfy G[A] → 1 (not the device's real gain). Concretely:
+
+| Model | Unity small-signal gain means... |
+|---|---|
+| Saleh | `alpha_a = 1.0` |
+| Tabulated AM-AM | `amp_out / amp_in → 1` as `amp_in → 0` |
+| Memory polynomial | order-1, tap-0 coefficient `a_{1,0} = 1.0` |
+| Volterra (diagonal / describing) | order-1, tap-0 coefficient `= 1.0` |
+| Volterra (full kernel) | `h1` = unit impulse — no additional filtering unless intentionally modeling dispersion beyond what the schematic already captures |
+
+This is why the `from_p1db_ip3()` convenience constructors default `small_signal_gain=1.0` — that default is not arbitrary, it is the correct value whenever the device's linear gain is already represented in the schematic (the expected case). If a nonlinear model is instead fit directly from a device's *full* measured response (e.g. `SalehModel.fit()` on a raw amp_in/amp_out sweep, or a tabulated curve taken straight from a datasheet without normalizing it), its small-signal gain will equal the device's actual gain — which double-counts that gain if the same device is also present in the schematic as a linear block.
+
+**Runtime check:** `siq.run()` warns if any nonlinear node's small-signal gain deviates from 0 dB by more than 3 dB (§8, step 2).
+
+**When this convention does not apply:** if a nonlinear element has no separate linear representation available (e.g. a passive mixer diode with no S-parameter model), the nonlinear node's small-signal gain may legitimately be non-unity — in that case the device's full response, gain included, belongs in the nonlinear annotation, and the SI schematic segment leading to that node must not also model the device.
+
 ---
 
 ## 4. Simulation Modes
@@ -102,6 +126,8 @@ Propagation order is determined by tracing signal flow from the voltage source t
 ---
 
 ## 5. Nonlinearity Models
+
+All models in this section are used under the gain convention defined in §3.6: each is normalized to unity small-signal gain, so the SI schematic supplies a device's linear response and these models supply only the amplitude-dependent deviation from it. This is also why the cubic model in §5.1 below is written as `f(x) = x + a·x³` rather than `f(x) = G₀·x + a·x³` — the linear term's coefficient is already fixed at 1 by convention.
 
 ### 5.1 Mathematical Foundation: Why Complex Baseband AM-AM is Exact (Narrowband Case)
 
@@ -419,7 +445,7 @@ The two are summed per realization before the QuTiP simulation.
       - Complex baseband: shift all H(ω) → H̃(f) = H(f + f_carrier)
       - Real-axis: use H(ω) directly
    └─ Run checks: isolation between NL nodes, harmonic suppression (baseband mode),
-      sample rate adequacy
+      sample rate adequacy, small-signal gain normalization of each NL node (§3.6)
 
 3. SETUP: BUILD SOURCE WAVEFORM
    └─ Complex baseband: SI Waveform envelope used directly as ũ(t)
@@ -598,16 +624,21 @@ schematic = siq.load_schematic("qubit_driveline.si")
 source = siq.SourceWaveform(carrier_freq_ghz=5.0, envelope=drag_si_waveform)
 
 # 3. Nonlinear annotations
+# NL_AMP1_OUT sits at AMP1's physical output. AMP1's small-signal S-parameters
+# (its linear ~20 dB gain) are already a block in the .si schematic (§3.6), so
+# alpha_a is normalized to 1.0 — this model supplies only AMP1's
+# amplitude-dependent compression on top of that linear response.
 nonlinear_nodes = {
     # Complex baseband mode: Saleh model
     "NL_AMP1_OUT": {
         "model": "saleh",
-        "alpha_a": 2.16, "beta_a": 1.15,
+        "alpha_a": 1.0, "beta_a": 1.15,
         "alpha_phi": 0.0, "beta_phi": 0.0,
     },
 }
 
 # Real-axis mode: Volterra
+# small_signal_gain is omitted here and defaults to 1.0, consistent with §3.6.
 nonlinear_nodes_realaxis = {
     "NL_AMP1_OUT": {
         "model": "volterra",
@@ -744,5 +775,5 @@ siq.compare_modes(result, result_real)   # Warns if modes disagree beyond tolera
 ---
 
 *Document maintained by: [Author]*
-*Last updated: June 2026*
-*Status: Pre-development / Seed document v0.4*
+*Last updated: July 2026*
+*Status: Pre-development / Seed document v0.5*

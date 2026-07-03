@@ -348,6 +348,9 @@ The engine emits Python `warnings.warn()` calls (not exceptions) for:
 - Memory regime: τ_reflection/T_pulse > 1.0 (reflection arrives post-pulse)
 - Narrowband ratio BW/fc > 5% (baseband mode validity)
 - Sample rate insufficient for harmonic tracking (real-axis mode)
+- NL node small-signal gain deviates from unity by > 3 dB — likely double-counted
+  amplifier gain against the schematic (PRD §3.6, new in v0.5; see
+  `nonlinear/registry.py::_check_small_signal_gain`)
 
 These are warnings not errors — the simulation proceeds. The user can escalate
 them to errors with `warnings.filterwarnings('error', ...)` if desired.
