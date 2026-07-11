@@ -8,7 +8,7 @@ setup(
     version="0.1.0-dev",
     description="Bridges SignalIntegrity drive-chain simulation with QuTiP gate fidelity analysis",
     packages=find_packages(),
-    python_requires=">=3.10",
+    python_requires=">=3.9",
     install_requires=[
         "numpy>=1.24",
         "scipy>=1.10",

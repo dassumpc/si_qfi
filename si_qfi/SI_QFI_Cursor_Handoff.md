@@ -31,9 +31,7 @@ si_qfi/
 ├── nonlinear/
 │   ├── __init__.py                   ✅
 │   ├── base.py                       ✅ NonlinearNode abstract base class
-│   ├── saleh.py                      ✅ Saleh AM-AM/AM-PM model
-│   ├── amam_ampm.py                  ✅ Tabulated AM-AM/AM-PM with cubic spline
-│   ├── memory_polynomial.py          ✅ Memory polynomial model
+│   ├── saleh.py                      ✅ SalehModel (baseband) + SalehRealAxisModel (real-axis)
 │   ├── volterra.py                   ✅ Volterra series (real-axis mode)
 │   └── registry.py                   ✅ Annotation dict → NonlinearNode factory
 │
@@ -85,27 +83,47 @@ import sys; sys.path.insert(0, '.')
 All 17 tests currently pass. These cover:
 - Saleh gain compression, zero-input safety, P1dB -1dB result
 - The 3/4 describing function coefficient (PRD §5.1 core math)
-- Tabulated AM-AM gain and phase accuracy
-- Memory polynomial linear regime and zero-input
+- SalehRealAxisModel linear regime, compression, and 3rd-harmonic generation
 - Volterra linear regime and compression
 - Noise PSD from noise figure spec
 - Baseband and RF noise realization statistics
 
 ---
 
-## Cursor Task 1: schematic/loader.py
+## Cursor Task 1: schematic/loader.py — DONE (v0.7)
 
 **File:** `si_qfi/schematic/loader.py`
-**Status:** All logic stubbed with `# --- CURSOR NOTE ---` markers.
+**Status:** Fully implemented and verified against a real schematic
+(`tests/test_schematic_basic.si`) — no Cursor work remains here.
 
-### What it needs to do
+### What it does now
 
-Load a `.si` SignalIntegrity schematic file and return an `SISchematic` dataclass
-with the following information extracted:
-- List of all VoltageProbe labels in the schematic
-- Verification that a VoltageSource device exists
-- List of NL_ prefixed probe labels in topological signal-flow order
-- Confirmation that `QUBIT_PROBE` label exists
+Loads a `.si` SignalIntegrity schematic file and returns an `SISchematic`
+dataclass with:
+- List of all probe labels in the schematic (`port_names`)
+- Verification that a source device named `source_label` exists (default
+  `'VSource'`, overridable per schematic — `load_schematic(path,
+  source_label=...)`)
+- Confirmation that a probe named `qubit_probe_label` exists (default
+  `'VQubit'`, overridable — `load_schematic(path, qubit_probe_label=...)`)
+
+Real API details (verified against the installed SignalIntegrity source, not
+guessed): devices live at `si_app.Drawing.schematic.deviceList`; properties
+are read via `device['keyword'].GetValue()`; probes are identified by
+`device['partname'].GetValue()` in a fixed set (`'Output'`,
+`'DifferentialVoltageOutput'`, etc. — there is no `'VoltageProbe'` partname);
+sources are identified by `device.netlist['DeviceName']` in
+`('voltagesource', 'currentsource', 'networkanalyzerport')`, not by
+partname. See the module docstring for the full list.
+
+Note (v0.5 design change): the loader no longer scans for `NL_`-prefixed probes
+or attempts a topological sort — `nl_probe_labels` and `_topological_sort_probes`
+were removed. Nonlinear/noise node identity and NL propagation order now come
+entirely from the `nonlinear` / `noise` dicts passed to `siq.run()` (PRD §3.2,
+§3.5); the loader's only job is to expose the full `port_names` list so the
+engine can validate those annotation keys against it via the already-implemented
+`validate_node_labels()` (see bottom of `loader.py` — this function needs no
+Cursor work, it's pure Python with no SI API calls).
 
 ### Functions to implement
 
@@ -128,19 +146,6 @@ current SI version.
 Check that at least one VoltageSource device appears in `si_app.schematic.deviceList`.
 Raise `ValueError` if not found.
 
-**`_topological_sort_probes(si_app, nl_labels) -> list[str]`**
-
-Sort NL_ probe labels in signal-flow order from VoltageSource to QUBIT_PROBE.
-Options in increasing accuracy:
-1. **Simple (good enough for well-drawn schematics):** sort by X coordinate of probe
-   position in the schematic drawing.
-2. **Robust:** trace connectivity from VoltageSource through the net graph and record
-   the order NL_ probes are encountered. If SI exposes a netlist or connectivity graph,
-   use it.
-
-The warning in the current stub is acceptable for Phase 1 if topological sort is hard
-— users can just name their probes in order and the annotation dict key order is used.
-
 ### SI Headless App import pattern
 
 ```python
@@ -154,73 +159,50 @@ paths between versions.
 
 ---
 
-## Cursor Task 2: schematic/transfer_function.py
+## Cursor Task 2: schematic/transfer_function.py — DONE (v0.7)
 
 **File:** `si_qfi/schematic/transfer_function.py`
-**Status:** Math helpers fully implemented. SI API calls stubbed.
+**Status:** Fully implemented and verified against a real schematic
+(`tests/test_schematic_basic.si`) — no Cursor work remains here.
 
-### What it needs to do
+### What it does now
 
-For each pair of probe nodes (e.g. SOURCE → NL_AMP1_OUT, NL_AMP1_OUT → QUBIT_PROBE),
-extract the voltage transfer function H(f) = V_out / V_in from the SignalIntegrity
-schematic and convert it to a time-domain impulse response.
+There is no `si_app.SParameters()` method (the earlier stub guess was wrong).
+The real hookup uses `si_app.TransferParameters()`, which returns a `Result`
+(dict subclass) with `'source names'`, `'output waveform labels'`,
+`'transfer matrices'` keys, plus a convenience `Result.FrequencyResponse
+(from_name, to_name)` for by-name lookup — no port-index bookkeeping needed
+at all, so `_label_to_port_index` was removed entirely. Segment H(f) between
+two probes A→B (neither the source) is computed as
+`H_{source→B}(f) / H_{source→A}(f)` (exact by linearity) — see the module
+docstring for the full explanation, and `_extract_single_tf` /
+`_source_referenced_response` / `_get_transfer_parameters` for the
+implementation.
 
-The math conversion (`_to_impulse_response`, `_interpolate_tf`,
-`_tf_to_baseband_impulse`, `_tf_to_realaxis_impulse`) is already implemented and
-does not need to change.
-
-### Functions to implement
-
-**`_extract_single_tf(si_app, label_in, label_out, fs, mode, carrier_hz)`**
-
-This is the core SI API call. Needs to:
-1. Call `si_app.SParameters()` to get the full S-parameter matrix
-2. Map probe label strings to port indices
-3. Extract H(f) = sp[k][port_out][port_in] for each frequency k
-4. Call `_to_impulse_response(freqs, H, fs, mode, carrier_hz)` (already works)
-5. Return a `TransferFunction` dataclass
-
-Expected SI pattern:
-```python
-(sp, name) = si_app.SParameters()
-freqs = np.array(sp.f())          # frequency list in Hz
-# H_{out,in}(f) at each frequency:
-H = np.array([sp[k][i_out][i_in] for k in range(len(freqs))], dtype=complex)
-```
-
-**Verify:** The S-parameter indexing order. In SI it may be:
-- `sp[freq_index][port_out][port_in]` (most likely)
-- `sp[port_out][port_in][freq_index]`
-
-Check against the SI SParameters class definition.
-
-**`_label_to_port_index(si_app, label) -> int`**
-
-Map a probe label string to its integer port index in the S-parameter matrix.
-Port ordering in SI's S-parameter output matches the order probes appear in the
-schematic's port list. Build the mapping by enumerating:
-```python
-port_map = {}
-for i, device in enumerate(si_app.schematic.deviceList):
-    if device.partname == 'VoltageProbe':
-        label = device.propertiesByName['ref'].value
-        port_map[label] = i
-```
-Cache this mapping; don't call SI once per lookup.
-
-### Important: SOURCE label handling
-
-The engine uses `"SOURCE"` as a synthetic label for the VoltageSource input port.
-`_label_to_port_index` needs to handle this by finding the VoltageSource device and
-returning its port index. The VoltageSource is port 1 (input) of the schematic in
-most SI setups — verify against the schematic.
+**v0.7 design change:** extraction (`extract_all_transfer_functions`,
+`extract_noise_transfer_functions`, `_extract_single_tf`) no longer takes a
+`SourceWaveform`, `mode`, or `carrier_hz` at all — it's purely
+schematic-derived (`TransferFunction.h`/`.dt` are `None` until a separate
+`compute_impulse_response(tf, fs, mode, carrier_hz)` call, made by the engine
+once a concrete waveform is available). Real-axis mode now runs at the
+schematic's own native sample rate (`native_sample_rate()`, 2× the top
+frequency of its sweep) rather than interpolating H(f) onto the drive
+waveform's fs — the waveform is resampled to match instead
+(`SourceWaveform.rf_waveform_at()`). See PRD §3.3 for the full rationale.
 
 ### Already-implemented math (do not change)
 
-- `_to_impulse_response()` — dispatches to baseband or real-axis conversion
+- `compute_impulse_response(tf, mode, *, fs=None, carrier_hz=None)` — mode-dependent
+  conversion, deferred to run() time (v0.7+): baseband uses
+  `_tf_to_baseband_impulse()` and requires both `fs`/`carrier_hz` (raises
+  `ValueError` if either is missing); real-axis reuses SI's own
+  `FrequencyResponse.ImpulseResponse()` with no target rate at all (v0.10) —
+  it ignores `fs` entirely and derives its own native rate from
+  `TransferFunction.si_frequency_response` directly, rather than a
+  hand-rolled IRFFT (v0.8). `freqs`/`H` are properties derived from
+  `si_frequency_response` (v0.9), not stored fields.
 - `_tf_to_baseband_impulse()` — shifts H(f+fc) to baseband, IFFTs to h̃(τ)
-- `_tf_to_realaxis_impulse()` — irfft to real h(τ)
-- `_interpolate_tf()` — magnitude + unwrapped phase interpolation onto new grid
+- `_interpolate_tf()` — magnitude + unwrapped phase interpolation onto new grid (baseband only)
 - `compute_isolation_db()` — reverse transfer function isolation check
 
 ---
@@ -293,7 +275,7 @@ The simulation engine (`simulation/engine.py`) runs two completely separate pass
 ```
 source waveform
   → convolve with h_1(τ)   [SI segment 1 transfer function]
-  → apply NL_1 model        [Saleh / tabulated / memory polynomial]
+  → apply NL_1 model        [Saleh]
   → convolve with h_2(τ)   [SI segment 2 transfer function]
   → apply NL_2 model
   → ...
@@ -315,14 +297,22 @@ This separation is valid because noise is linear — it can be propagated indepe
 of the nonlinear signal path. The `NoisePropagator` class in `noise/propagation.py`
 implements Pass 2. The engine in `simulation/engine.py` orchestrates both.
 
-### Nonlinear node naming convention
+### Nonlinear node naming convention (v0.5 design change)
 
-NL nodes are identified by probe labels starting with `NL_` in the SI schematic.
-The annotation dict key must exactly match the probe label in the schematic.
+NL nodes are **not** auto-detected from the schematic by prefix, and `NL_` is
+**not** required or enforced anywhere in the code (`build_nonlinear_nodes` in
+`registry.py` used to require it and no longer does — any existing probe label
+works). The annotation dict key must exactly match an existing probe label in
+the schematic, whatever that label is. `siq.run()` validates every
+`nonlinear` / `noise` key against `schematic.port_names` via
+`schematic.loader.validate_node_labels()` before doing anything else, and raises
+a `ValueError` listing any labels that don't match a real probe. `NL_`-prefixed
+names remain a reasonable convention for schematic readability, just not a
+functional requirement.
 
 ```
-Schematic probe label: "NL_AMP1_OUT"
-annotation key:        "NL_AMP1_OUT"   ← must match exactly
+Schematic probe label: "AMP1_OUT"       (no NL_ prefix required)
+annotation key:        "AMP1_OUT"       ← must match exactly, checked at run() time
 ```
 
 ### Mode selection affects everything downstream
@@ -330,13 +320,15 @@ annotation key:        "NL_AMP1_OUT"   ← must match exactly
 `mode='complex_baseband'` (default):
 - Source waveform: complex envelope ũ(t)
 - Transfer functions: shifted to baseband H̃(f) = H(f + fc)
-- Nonlinear models: Saleh, TabulatedAMAM, MemoryPolynomial
+- Nonlinear models: SalehModel
 - QuTiP input: I/Q components of ũ(t) directly → rotating frame H(t)
 
 `mode='real_axis'`:
 - Source waveform: full RF v(t) = Re{ũ(t)·exp(j2πfc·t)}
 - Transfer functions: full H(f) — no shift
-- Nonlinear models: VolterraModel only
+- Nonlinear models: VolterraModel (`'volterra'`), or SalehRealAxisModel (built
+  from the same `'saleh'` model string as the baseband case, dispatched by
+  `mode` in `registry.py`)
 - QuTiP input: demodulate v_qubit(t) to I/Q first, then rotating frame H(t)
 
 ### Diagnostic warnings
@@ -368,14 +360,20 @@ H̃(f_bb) = H(f_bb + f_carrier)    # shift to baseband
 h̃(τ) = IFFT[H̃]                   # complex baseband impulse response
 ```
 
-For real-axis mode:
-```
-h(τ) = IRFFT[H(f)]                # real impulse response
-```
+For real-axis mode (v0.8): rather than IRFFT-ing `H(f)` ourselves, we call SI's
+own `FrequencyResponse.ImpulseResponse()` on the native `FrequencyResponse`
+object stashed on `TransferFunction.si_frequency_response` at extraction time
+(v0.9 renamed this from the private-looking `_si_fr` — it's now the sole,
+required source of `freqs`/`H`, not just an optional internal hint, since
+TransferFunction is always schematic-backed). Its native sample rate
+(`FrequencyList.TimeDescriptor()`'s `Fs = 2×top_frequency`) is verified to
+match `native_sample_rate()` exactly, so there's no grid mismatch with the
+drive waveform (resampled via `SourceWaveform.rf_waveform_at()`).
 
-The functions `_tf_to_baseband_impulse()` and `_tf_to_realaxis_impulse()` in
-`schematic/transfer_function.py` implement this. They need only the raw `H(f)`
-array and `freqs` array from the SI SParameters call.
+`_tf_to_baseband_impulse()` in `schematic/transfer_function.py` implements the
+baseband path only — it needs the raw `H(f)`/`freqs` arrays and a carrier
+frequency, since the frequency-shift `H(f+fc)` isn't something SI's own
+`ImpulseResponse()` does.
 
 ### Noise propagation (already implemented)
 
@@ -392,9 +390,51 @@ For f(x) = x + a·x³ (cubic nonlinearity), after bandpass filtering:
 ```
 A_out = A + (3a/4)·A³
 ```
-The `(3/4)` factor is exact (from cos³θ = (3/4)cosθ + (1/4)cos3θ).
-The `MemoryPolynomial.from_p1db_ip3()` and `SalehModel.from_p1db_ip3()` both
-use this result. The test `test_describing_function_coefficient` verifies it.
+The `(3/4)` factor is exact (from cos³θ = (3/4)cosθ + (1/4)cos3θ). It cancels
+against the real-axis two-tone IP3 definition's `(4/3)` factor exactly, which
+is why `SalehModel`'s (complex-baseband) beta_a-from-OIP3 formula is
+`beta_a = 1/A_IP3,in²` (NOT `(4/3)/A_IP3,in²`) -- a real bug fixed in this
+codebase after initially copying VolterraModel's real-axis formula wholesale
+into the baseband derivation. `SalehRealAxisModel` (nonlinear/saleh.py),
+which operates directly on the real waveform rather than an envelope, DOES
+use the `(4/3)` factor, matching VolterraModel exactly -- see its module
+docstring's "Real-axis variant" section for the full derivation of both
+cases. All nonlinearity specs (`op1db_amplitude`/`oip3_amplitude`) are
+OUTPUT-referred by convention (see nonlinear/volterra.py's module docstring).
+The test `test_describing_function_coefficient` verifies the baseband case.
+
+`SalehModel.from_op1db_oip3()`/`SalehRealAxisModel.from_op1db_oip3()` take no
+`small_signal_gain`/gain argument at all -- alpha_a is always 1.0 (purely
+output-referred nonlinearity, no gain-driven input/output conversion). The
+general `SalehModel(alpha_a, beta_a, ...)` constructor is still the escape
+hatch for a non-unity alpha_a in PRD §3.6's "when this convention does not
+apply" case.
+
+**Only ONE of op1db_amplitude/oip3_amplitude, never both:** `SalehModel`/
+`SalehRealAxisModel.from_op1db_oip3()` and `VolterraModel(option='describing')`
+each raise `ValueError` if given both (previously supported via a 5th-order
+Volterra term / a `gamma_a` Saleh denominator term -- both removed to keep
+the model surface small, PRD §5.1). Fitting from OIP3 alone therefore
+*determines* (doesn't leave free) where the model's actual OP1dB falls --
+different per model shape: ~10.1dB below OIP3 for Saleh's rational G[A],
+~10.6dB for a plain cubic Volterra polynomial (PRD §5.1 table,
+tests/test_nonlinear.py).
+
+**`VolterraModel` also takes no `small_signal_gain` argument at all (2026-07-08):**
+its `option='describing'`/`'diagonal'` k=1, m=0 coefficient (a1) is always
+fixed at 1.0 -- not a constructor parameter, matching `SalehModel`'s
+`alpha_a=1.0` precedent above. `nonlinear/registry.py::_build_volterra()`
+raises `ValueError` if a spec dict includes `'small_signal_gain'`, same as
+`_build_saleh()` already did. This was a real, if narrow, gap: the earlier
+`from_op1db_oip3()` gain removal only touched Saleh's factory function;
+`VolterraModel`'s *direct* constructor kept `small_signal_gain` (default
+1.0) since it was a different code path and never explicitly asked about --
+functionally it only ever needed to be 1.0 in practice (PRD §3.6's gain
+convention, enforced at runtime by `_check_small_signal_gain`), so removing
+it is a pure simplification, not a behavior change for any correctly-
+configured node. `option='diagonal'` (caller supplies `coefficients`
+directly) is unaffected -- still able to set a non-unity k=1 coefficient if
+you construct it that way, still checked (warned, not rejected) at runtime.
 
 ---
 

@@ -13,9 +13,7 @@ si_qfi/
 ├── __init__.py               Top-level API: load_schematic, SourceWaveform, run
 ├── source/waveform.py        SourceWaveform, DRAG/Gaussian envelope generators
 ├── nonlinear/
-│   ├── saleh.py              Saleh AM-AM/AM-PM model (baseband)
-│   ├── amam_ampm.py          Tabulated AM-AM/AM-PM with cubic spline (baseband)
-│   ├── memory_polynomial.py  Memory polynomial model (baseband)
+│   ├── saleh.py              SalehModel (baseband) + SalehRealAxisModel (real-axis)
 │   ├── volterra.py           Volterra series (real-axis only)
 │   └── registry.py           Parse annotation dict → NonlinearNode objects
 ├── noise/
@@ -35,12 +33,12 @@ si_qfi/
 
 ## What is implemented (no SI/QuTiP needed)
 
-- All nonlinear models: Saleh, tabulated AM-AM/AM-PM, memory polynomial, Volterra
+- All nonlinear models: Saleh (baseband + real-axis variant), Volterra
 - Noise PSD computation from all spec types
 - Stochastic noise realization generation (baseband and real-axis)
 - NoisePropagator (two-pass architecture)
 - Simulation engine two-pass loop
-- Diagnostic checks (isolation, harmonic suppression, memory regime, narrowband)
+- Diagnostic checks (isolation, harmonic suppression, narrowband)
 - Quantum module: Transmon H₀, gate unitary library, FidelityResult
 - Unit tests for all of the above
 
@@ -50,7 +48,10 @@ si_qfi/
 All functions marked `# --- CURSOR NOTE ---`. Key tasks:
 - `_extract_port_names(si_app)`: enumerate VoltageProbe labels from schematic
 - `_check_voltage_source_present(si_app)`: find VoltageSource device
-- `_topological_sort_probes(si_app, nl_labels)`: trace signal flow order
+
+Nonlinear/noise node identity and order come from the `nonlinear`/`noise` dicts
+passed to `siq.run()`, not from schematic scanning — see `validate_node_labels()`
+in this file (already implemented, no SI API needed).
 
 Start with the SI repo's `SignalIntegrityAppHeadless` class and inspect
 `app.schematic.deviceList` to understand device enumeration.
@@ -70,11 +71,28 @@ Marked with `# --- CURSOR NOTE ---`. Verify:
 
 ---
 
+## Setup
+
+`setup.py` lives at the repository root (one level above this `si_qfi/` package
+directory — note the repo root and the package directory share the same name,
+which is easy to confuse). Install once, in editable mode, from the repo root:
+
+```bash
+cd ..            # to the repo root, where setup.py lives (not this si_qfi/ folder)
+pip install -e .
+```
+
+After that, `import si_qfi` works from any directory, in any script or test
+run — you do not need to `cd` into this folder or manipulate `sys.path`
+yourself. (Running scripts/tests *without* this install step, from inside
+this `si_qfi/` package folder, is the most common cause of
+`ModuleNotFoundError: si_qfi` — there is no `si_qfi` package nested inside
+itself for Python to find.)
+
 ## Running tests (no SI or QuTiP required)
 
 ```bash
-cd si_qfi
-pip install numpy scipy matplotlib pytest
+pip install pytest
 pytest tests/test_nonlinear.py -v
 ```
 

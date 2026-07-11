@@ -1,5 +1,5 @@
 # SI-QFI: Signal Integrity Quantum Fidelity Impact Plugin
-### Project Definition Document v0.5
+### Project Definition Document v0.15
 
 ---
 
@@ -10,8 +10,8 @@
 **Summary:** SI-QFI is an open-source Python plugin that bridges classical microwave signal integrity (SI) analysis with quantum gate fidelity simulation. The user defines the entire drive chain as a single SignalIntegrity schematic. SI-QFI extracts transfer functions, propagates the drive waveform through each stage (applying nonlinear models at designated nodes), adds stochastic noise, and feeds the resulting waveform at the qubit plane into QuTiP to compute gate fidelity.
 
 **Two simulation modes are supported:**
-- **Complex baseband mode (default):** Propagates the complex envelope at baseband. Supports memoryless AM-AM/AM-PM and memory polynomial nonlinearity. Efficient sample rate; natural interface to QuTiP rotating frame. Valid when the narrowband assumption holds and channel harmonics are well-filtered.
-- **Full real-axis mode:** Propagates the full real RF waveform on the complete frequency axis. Requires Volterra series nonlinearity. Exactly tracks harmonic generation and inter-harmonic mixing. Required when the narrowband assumption breaks down or when harmonic content reaching the qubit plane is non-negligible.
+- **Complex baseband mode (default):** Propagates the complex envelope at baseband. Supports memoryless AM-AM/AM-PM nonlinearity (Saleh, tabulated). Efficient sample rate; natural interface to QuTiP rotating frame. Valid when the narrowband assumption holds and channel harmonics are well-filtered.
+- **Full real-axis mode:** Propagates the full real RF waveform on the complete frequency axis. Requires a real-axis nonlinearity model (Volterra series, §5.3; or the real-axis Saleh variant, §5.4). Exactly tracks harmonic generation and inter-harmonic mixing. Required when the narrowband assumption breaks down or when harmonic content reaching the qubit plane is non-negligible.
 
 ---
 
@@ -35,16 +35,33 @@
 
 ### 3.1 Required Elements
 
-- **One voltage source** (`VoltageSource`): drive signal injection point.
-- **One output probe** (`VoltageProbe`, labeled `QUBIT_PROBE`): qubit plane extraction point.
+- **One voltage/current source device**, whose `ref` matches `source_label` (default `'VSource'`) — the drive injection point, and the reference point every relative transfer function is computed against (§3.3).
+- **One output probe**, whose `ref` matches `qubit_probe_label` (default `'VQubit'`) — the qubit plane extraction point.
+
+Both labels are parameters of `siq.load_schematic(path, qubit_probe_label='VQubit', source_label='VSource')`, overridable per schematic — there is nothing special about the default strings beyond being the convention used by `tests/test_schematic_basic.si`.
 
 ### 3.2 Nonlinear Node Probes
 
-A nonlinear node is declared by placing a `VoltageProbe` labeled `NL_<name>` at the point in the schematic where nonlinearity is applied. SI-QFI uses these as cut points between propagation segments.
+**Nonlinear nodes are declared entirely by the `nonlinear` dict passed to `siq.run()` — not by any naming convention in the schematic itself.** A key in `nonlinear` names the `VoltageProbe` in the schematic where that nonlinearity is applied, and SI-QFI uses these as cut points between propagation segments. Probes are commonly named `NL_<name>` by convention for readability, but this is not required, auto-detected, or enforced anywhere in the code — any existing probe label works, `NL_` prefix or not.
+
+Before use, SI-QFI validates that every key in `nonlinear` (and, separately, every key in `noise`) names a probe that actually exists in the loaded schematic, raising a `ValueError` listing the offending label(s) and the full set of valid probe names if not (`schematic.loader.validate_node_labels()`). This is a deliberate single-source-of-truth design: earlier revisions had the schematic loader independently scan for `NL_`-prefixed probes, which could silently diverge from the `nonlinear` dict the user actually passed to `run()` — e.g. a typo in an annotation key would mean that stage's nonlinearity was never applied, with no warning. The current design has one source of truth (the annotation dicts) and one validation step against the schematic.
 
 ### 3.3 Transfer Function Extraction
 
-For each segment between adjacent probes, SI-QFI extracts the voltage transfer function H_k(ω) = V_out(ω)/V_in(ω) from the SignalIntegrity schematic. In complex baseband mode this is shifted to baseband: H̃_k(f) = H_k(f + f_carrier). In real-axis mode the full one-sided transfer function H_k(f) is used directly.
+For each segment between adjacent probes, SI-QFI extracts the voltage transfer function H_k(ω) = V_out(ω)/V_in(ω) from the SignalIntegrity schematic. **Extraction is waveform-agnostic**: it depends only on the schematic, never on any particular drive waveform's sample rate, carrier frequency, or mode — it returns H_k(ω) purely as a function of frequency. Converting a raw H_k(ω) into a time-domain impulse response h_k(τ) — which does need a target sample rate, mode, and (for baseband) carrier frequency — is a separate, later step, done once a specific `SourceWaveform` is available (i.e. at `siq.run()` time, not at schematic-load time).
+
+**Implementation note (source-referenced ratio):** SignalIntegrity's headless API only exposes transfer functions referenced to the source (`source_label` → each probe), never probe-to-probe directly. SI-QFI computes every segment H_k(ω) between two probes A → B (neither of which is `source_label`) as the ratio H_{source→B}(f) / H_{source→A}(f) — exact by linearity, since both are responses of the same linear network to the same source. When A *is* `source_label`, H_k is simply H_{source→B}(f) directly, no division needed. This is why `source_label` is required as an explicit reference for every extraction, not just for waveform injection. This division uses SI's own `FrequencyResponse` division operator directly (it's already implemented there), rather than SI-QFI dividing raw numpy arrays itself.
+
+**Reuse of SI's own frequency-domain machinery, without a hard dependency:** `TransferFunction` stores the native SI `FrequencyResponse` object it was extracted from, as `si_frequency_response` (untyped — no SI import needed to declare the field). This lets real-axis mode's impulse response reuse SI's own `FrequencyResponse.ImpulseResponse()` rather than a hand-rolled IRFFT (see below). `TransferFunction` deliberately does **not** inherit from SI's `FrequencyResponse` class, even though it might seem natural to: that would require importing SignalIntegrity at module level in `schematic/transfer_function.py`, which is imported unconditionally by the engine and then by the top-level `si_qfi` package — making SignalIntegrity a hard dependency just to `import si_qfi`, and breaking the "core math works without SI installed" property the rest of the codebase preserves by importing SI lazily inside function bodies only where it's actually used.
+
+**`freqs`/`H` are derived, not stored:** since `TransferFunction` is always constructed from a schematic (never manually, with independent frequency-domain data), `freqs` and `H` are `@property` methods computed from `si_frequency_response` on access, rather than separately-stored fields that could in principle drift out of sync with it. Every existing call site reads them as plain attributes (`tf.H`, `tf.freqs[-1]`, etc.), so this is transparent to callers.
+
+**`compute_impulse_response(tf, mode, *, fs=None, carrier_hz=None)`:** `fs`/`carrier_hz` are keyword-only and optional, because only complex baseband mode actually needs them (and raises `ValueError` if either is missing). Real-axis mode calls `si_frequency_response.ImpulseResponse()` with no target rate at all — SI derives its own native rate directly from the FrequencyResponse's own frequency grid, ignoring any `fs` the caller passes (which, per `native_sample_rate()`, could only ever equal that same native rate anyway — passing it would be redundant, not just unused).
+
+**Who adapts to whom — mode-dependent:** the two modes disagree on whose sample rate governs the impulse response, because only one of them has a schematic-intrinsic rate:
+
+- **Real-axis mode:** the schematic has one natural, waveform-independent sample rate — 2× the top frequency of its own frequency sweep (matches SI's `CalculationProperties.UserSampleRate` for an evenly-spaced sweep from 0 to `EndFrequency` — verified against SI's own `FrequencyList.TimeDescriptor()` source, which derives the identical value). h_k(τ) is computed directly at that rate via SI's own `FrequencyResponse.ImpulseResponse()` — no interpolation of H(f), and no hand-rolled IRFFT either; SI's version additionally applies a fractional-delay correction around the FFT that a naive IRFFT skips — and the **drive waveform is resampled to match it** (mirroring SI's own `Waveform.Adapt()` idiom for fitting a waveform to a target time grid). Consequently the sample-rate-adequacy check (harmonic tracking, §6) runs against this native rate, not against the waveform's own `fs` — if it fails, increase the schematic's frequency sweep resolution, not the waveform's sample rate.
+- **Complex baseband mode:** there is no schematic-intrinsic baseband rate — it's fundamentally a pulse-bandwidth choice (the whole point of §4.1 is running two orders of magnitude below real-axis rate). So baseband mode keeps interpolating H(f) onto the target grid implied by the envelope's own fs/carrier, as before — the **transfer function adapts to the waveform** here, the opposite direction from real-axis mode.
 
 ### 3.4 Isolation and Harmonic Checks
 
@@ -56,7 +73,7 @@ For each segment between adjacent probes, SI-QFI extracts the voltage transfer f
 
 ### 3.5 Node Ordering
 
-Propagation order is determined by tracing signal flow from the voltage source to `QUBIT_PROBE`. If topology is ambiguous, SI-QFI raises an error.
+Propagation order is the `nonlinear` dict's key insertion order: `SOURCE → nonlinear.keys()[0] → nonlinear.keys()[1] → ... → QUBIT_PROBE`. The user is responsible for listing keys in signal-flow order; SI-QFI does not trace schematic topology to infer or verify it (automatic topological ordering from the schematic graph was considered but dropped in favor of the single-source-of-truth design in §3.2 — the annotation dict already needs to exist and be ordered for the model configuration itself, so reusing its order avoids a second, potentially conflicting mechanism).
 
 ### 3.6 Linear/Nonlinear Gain Split Convention
 
@@ -70,13 +87,13 @@ Propagation order is determined by tracing signal flow from the voltage source t
 
 | Model | Unity small-signal gain means... |
 |---|---|
-| Saleh | `alpha_a = 1.0` |
-| Tabulated AM-AM | `amp_out / amp_in → 1` as `amp_in → 0` |
-| Memory polynomial | order-1, tap-0 coefficient `a_{1,0} = 1.0` |
-| Volterra (diagonal / describing) | order-1, tap-0 coefficient `= 1.0` |
+| Saleh (complex baseband) | `alpha_a = 1.0` |
+| Saleh (real-axis variant) | `alpha_a = 1.0` |
+| Volterra (describing) | order-1, tap-0 coefficient (a1), always fixed `= 1.0` -- not a constructor parameter |
+| Volterra (diagonal) | order-1, tap-0 coefficient, should be `≈ 1.0` -- caller-supplied, checked at runtime |
 | Volterra (full kernel) | `h1` = unit impulse — no additional filtering unless intentionally modeling dispersion beyond what the schematic already captures |
 
-This is why the `from_p1db_ip3()` convenience constructors default `small_signal_gain=1.0` — that default is not arbitrary, it is the correct value whenever the device's linear gain is already represented in the schematic (the expected case). If a nonlinear model is instead fit directly from a device's *full* measured response (e.g. `SalehModel.fit()` on a raw amp_in/amp_out sweep, or a tabulated curve taken straight from a datasheet without normalizing it), its small-signal gain will equal the device's actual gain — which double-counts that gain if the same device is also present in the schematic as a linear block.
+This is why `SalehModel.from_op1db_oip3()`/`SalehRealAxisModel.from_op1db_oip3()` take no gain argument at all and always build `alpha_a=1.0` — there is no non-unity case to default away from; op1db_amplitude/oip3_amplitude alone fully determine a purely output-referred nonlinearity. `VolterraModel`'s `option='describing'`/`'diagonal'` constructor takes no `small_signal_gain` argument either (removed) — its k=1, m=0 coefficient (a1) is always fixed at 1.0 for the same reason. The general `SalehModel(alpha_a, beta_a, ...)` constructor still accepts an arbitrary alpha_a for the rare case below where this convention doesn't apply, and `VolterraModel(option='diagonal', coefficients=...)` still accepts an arbitrary k=1 coefficient if you supply `coefficients` yourself (checked at runtime, not enforced at construction).
 
 **Runtime check:** `siq.run()` warns if any nonlinear node's small-signal gain deviates from 0 dB by more than 3 dB (§8, step 2).
 
@@ -92,7 +109,7 @@ This is why the `from_p1db_ip3()` convenience constructors default `small_signal
 
 **Sample rate requirement:** Determined by pulse bandwidth, not carrier frequency. For a 100 MHz bandwidth pulse: ~200–400 MSa/s. Typically two orders of magnitude lower than real-axis mode.
 
-**Nonlinearity models available:** AM-AM/AM-PM (memoryless), memory polynomial. See §5.
+**Nonlinearity models available:** AM-AM/AM-PM (memoryless). See §5.
 
 **QuTiP interface:** I/Q components of ũ(t) feed directly into the rotating frame Hamiltonian. No demodulation step needed at the QuTiP boundary.
 
@@ -109,7 +126,7 @@ This is why the `from_p1db_ip3()` convenience constructors default `small_signal
 
 **Sample rate requirement:** Must satisfy Nyquist for the highest significant harmonic. For a 5 GHz carrier with third-harmonic tracking: minimum 30 GSa/s, practically 40–60 GSa/s. For fifth harmonic: 60+ GSa/s. This is set by the SignalIntegrity Waveform sample rate.
 
-**Nonlinearity models available:** Volterra series only. See §5.4. AM-AM/AM-PM is not available in real-axis mode because the envelope extraction it relies on is only defined for narrowband signals.
+**Nonlinearity models available:** Volterra series, or the real-axis Saleh variant (a bounded rational AM-AM-style curve applied directly to the instantaneous real waveform, rather than to an envelope amplitude). See §5.3–5.4. The complex-baseband AM-AM/AM-PM models are not available in real-axis mode because the envelope extraction they rely on is only defined for narrowband signals — the real-axis Saleh variant sidesteps this by not extracting an envelope at all.
 
 **QuTiP interface:** v(t) is passed as a real array coefficient to QobjEvo. The ODE solver must resolve the carrier oscillation — rotating frame demodulation is strongly recommended (SI-QFI performs this automatically before passing to QuTiP). Alternatively, QuTiP can be driven at full RF if the user explicitly disables demodulation, but integration will be slow.
 
@@ -229,47 +246,91 @@ A_IP3 = sqrt(-4/(3a))     (requires a < 0 for compression)
 The 1 dB compression point satisfies G[A_1dB] = 10^(-1/20) ≈ 0.891, giving:
 
 ```
-A_1dB = sqrt(-0.109 · 4 / (3a))  ≈  0.383 · A_IP3
+A_1dB = sqrt((1 - 10^(-1/20)) · 4 / (3a) · (-1))  =  sqrt(1 - 10^(-1/20)) · A_IP3  ≈  0.330 · A_IP3
 ```
 
-This 9.6 dB relationship between P1dB and IP3 is the well-known result for cubic-only
-nonlinearity, and provides a direct way to fit the coefficient a from a single P1dB
-measurement.
+i.e. **A_1dB/A_IP3 ≈ -9.6 dB** (input-referred, single-tone CW fundamental) — the
+well-known result for cubic-only nonlinearity: with only one free coefficient (a)
+besides the fixed linear term, a single cubic term can match ONE of P1dB/IP3, not both
+independently — P1dB then comes out wherever the cubic implies it, not as a
+separately-controllable input. Output-referred (OP1dB vs. OIP3, i.e. including the 1dB
+of compression itself), this becomes **≈ -10.6 dB** — see "OIP3-only implies a specific
+OP1dB" below.
 
-### 5.2 AM-AM / AM-PM Models (Complex Baseband Mode Only)
+**OP1dB/OIP3 naming and output-referred convention:** all P1dB/IP3-style constructor
+parameters in the code (`op1db_amplitude`, `oip3_amplitude`) are named with an explicit
+`o` prefix and are **output-referred** — the actual output amplitude at that point, not
+the input amplitude that produced it (converted internally to input-referred amplitudes
+before applying the formulas above). The bare "IP3"/"P1dB" terminology above refers to
+the general mathematical relationship, which is referencing-convention-agnostic.
 
-**Saleh Model (default for amplifiers):**
+**Only ONE of OP1dB or OIP3 may be specified — never both.** `VolterraModel
+(option='describing')` and `SalehModel`/`SalehRealAxisModel.from_op1db_oip3()` each
+have exactly one free shape parameter (`a3` for Volterra's cubic, `β_a` for Saleh's
+rational `G[A] = α_a/(1+β_a·A²)`), which can only be calibrated from ONE point. An
+earlier version of this codebase added a second free parameter to each model (a 5th-order
+Volterra term, a `γ_a` Saleh denominator term) specifically to fit both points
+simultaneously — removed, to keep the model surface small (only one nonlinearity
+"shape" per model now, not a family of them). Both constructors raise `ValueError` if
+given neither or both of op1db_amplitude/oip3_amplitude.
+
+**OIP3-only implies a specific OP1dB (and vice versa) — NOT a free choice:** since each
+model has only one free shape parameter, fitting from OIP3 alone *determines* where the
+model's actual OP1dB falls (it isn't independently choosable). This value is
+**different for each model**, because they're different nonlinearity *shapes* that only
+agree asymptotically (same leading-order/IP3 behavior), not at the compression point:
+
+| Model | OIP3-only implied OP1dB (output-referred) |
+|---|---|
+| SalehModel (baseband, bounded rational `G[A]`) | ≈ **-10.14 dB** below OIP3 |
+| VolterraModel (real-axis, plain cubic — single-tone CW fundamental) | ≈ **-10.64 dB** below OIP3 |
+| SalehRealAxisModel (real-axis, bounded rational) | ≈ **-10.1 dB** below OIP3 (matches baseband closely — see below) |
+
+Verified in `tests/test_nonlinear.py` — closed-form for Saleh/Volterra, and via actual
+single-tone simulation (FFT-extracted fundamental) for the real-axis models, since the
+raw polynomial/rational curve evaluated at a *constant* input is a different, non-
+physical quantity for a real-axis model (see nonlinear/volterra.py's and
+nonlinear/saleh.py's module docstrings — a real-axis memoryless nonlinearity produces
+harmonics when driven by an actual waveform, so "where does the fundamental compress by
+1dB" and "where does the raw curve itself cross -1dB" are different questions).
+
+**Domain-dependent OIP3 factor:** the β_a-from-OIP3 formula above is only exact for the
+complex-baseband/envelope case (`β_a = 1/A_IP3,in²`, no 4/3 factor — the baseband
+envelope's own (3/4) in-band reduction factor exactly cancels the (4/3) that appears in
+the real-axis derivation in this section). The real-axis Saleh variant (§5.4) uses
+`β_a = (4/3)/A_IP3,in²`, matching VolterraModel exactly, since it operates directly on
+the real waveform. See nonlinear/saleh.py's module docstring for the full derivation of
+both cases, and TestSalehBasebandRealAxisEquivalence in tests/test_nonlinear.py for the
+verification that this factor makes the two domains describe the same physical
+amplifier (to good — not exact — approximation, since the two rational curves aren't
+algebraically identical).
+
+### 5.2 Saleh AM-AM / AM-PM Model (Complex Baseband Mode Only)
+
+The classic 2-parameter Saleh form:
 
 ```
-G[A] = α_a · A / (1 + β_a · A²)
+G[A] = α_a / (1 + β_a · A²)
 Φ[A] = α_φ · A² / (1 + β_φ · A²)
 
-ũ_out(t) = G[|ũ_in(t)|] · exp(j·Φ[|ũ_in(t)|]) · ũ_in(t) / |ũ_in(t)|
+ũ_out(t) = G[|ũ_in(t)|] · exp(j·Φ[|ũ_in(t)|]) · ũ_in(t)
 ```
 
-Fit parameters (α_a, β_a, α_φ, β_φ) from measured P1dB and phase-vs-power data via
-`scipy.optimize.curve_fit`. Convenience fit from P1dB + IP3 scalars also provided.
+Built from EXACTLY ONE of OP1dB or OIP3 (output-referred; see §5.1's "Only ONE of OP1dB
+or OIP3 may be specified") via `from_op1db_oip3()`, which takes no gain argument at all
+-- alpha_a is always 1.0, a purely output-referred nonlinearity (see the gain-convention
+table in §3.6). There is no fit-from-raw-measurement or tabulated-curve path in this
+codebase currently -- `SalehModel(alpha_a, beta_a, ...)`'s general constructor is the
+escape hatch for a non-unity alpha_a in the rare case where §3.6's convention doesn't
+apply.
 
-**Tabulated AM-AM / AM-PM:**
+Even this classic form has a genuine breakdown amplitude: raw output y(A) =
+α_a·A/(1+β_a·A²) peaks at A=1/sqrt(β_a) and DECLINES beyond that (never true for a real
+amplifier short of hard clipping), even though gain itself compresses monotonically the
+whole time. `max_monotonic_amplitude` = 1/sqrt(β_a); `apply_baseband()` warns if driven
+past it -- see nonlinear/saleh.py module docstring.
 
-Measured curves supplied as numpy arrays of (V_in, V_out) and (V_in, phase_rad) pairs.
-Interpolated via `scipy.interpolate.CubicSpline`. No parametric fit required. This is
-the most accurate representation of a measured amplifier.
-
-### 5.3 Memory Polynomial (Complex Baseband Mode Only)
-
-Extends the memoryless AM-AM to include finite memory depth M (in samples):
-
-```
-ũ_out(t) = Σ_{k∈{1,3,5}} Σ_{m=0}^{M} a_{km} · ũ(t-mT) · |ũ(t-mT)|^(k-1)
-```
-
-Odd orders only. M = 0 reduces to memoryless AM-AM (with Volterra coefficients). 
-Valid when reflection delay τ is comparable to pulse width but harmonic suppression
-still holds. Coefficients identified via least-squares from swept-tone measurements,
-or set from a P1dB / IP3 parameterization with user-specified memory depth.
-
-### 5.4 Volterra Series (Real-Axis Mode Only)
+### 5.3 Volterra Series (Real-Axis Mode Only)
 
 The full Volterra series for a real-valued signal, truncated to third order:
 
@@ -291,7 +352,7 @@ for linear segment propagation. h₂ and h₃ are the nonlinear kernels.
 
 **Practical parameterization options:**
 
-Option A — Diagonal kernels (memory polynomial equivalent on real axis):
+Option A — Diagonal kernels (memoryless-per-tap polynomial on real axis):
 ```
 y(t) ≈ Σₙ Σₘ aₙₘ · x(t-mT)^n
 ```
@@ -303,9 +364,11 @@ User supplies h₁(τ), h₃(τ₁,τ₂,τ₃) as sampled arrays. h₂ can be s
 for systems with odd-symmetric nonlinearity (most amplifiers).
 
 Option C — Measured describing function (default for real-axis mode):
-SI-QFI measures h₁ from the SI transfer function and parameterizes h₃ from 
-P1dB and IP3 measurements using the cubic kernel result (§5.1). This provides
-a practical real-axis simulation without requiring full kernel identification.
+SI-QFI measures h₁ from the SI transfer function and parameterizes h₃ from
+EXACTLY ONE of a P1dB or IP3 measurement using the cubic kernel result (§5.1)
+-- never both (see §5.1's "Only ONE of OP1dB or OIP3 may be specified"). This
+provides a practical real-axis simulation without requiring full kernel
+identification.
 
 **Relationship to complex baseband mode:**
 
@@ -314,6 +377,38 @@ produce identical in-band output. The Volterra series additionally produces harm
 content that AM-AM discards. Real-axis mode with Volterra and complex baseband mode
 with AM-AM are therefore expected to agree at the qubit plane whenever the harmonic
 suppression check passes — this provides a built-in cross-validation path.
+
+### 5.4 Real-Axis Saleh Variant (Real-Axis Mode Only)
+
+`SalehRealAxisModel` (in nonlinear/saleh.py) applies the same bounded rational G[A]
+curve as the complex-baseband Saleh model (§5.2), but directly to the instantaneous
+real waveform x(t) rather than to an envelope magnitude:
+
+```
+G[A] = α_a / (1 + β_a · A²)
+
+y(t) = G[x(t)] · x(t)
+```
+
+Since G[A] only uses A², this is well-defined for signed x(t) and automatically
+odd-symmetric (matching a real amplifier's AM-AM curve). Applying it directly to the
+real waveform means it generates genuine harmonic/intermodulation content via ordinary
+waveform distortion — the same mechanism the Volterra series exploits — while staying
+bounded/saturating everywhere (β_a > 0 guarantees no pole, unlike a truncated polynomial
+which will eventually turn over -- see §5.2's max_monotonic_amplitude note, which
+applies here too) (see the "Domain-dependent OIP3 factor" note in §5.1 for why β_a's
+OIP3 formula differs by a factor of 4/3 between this model and the complex-baseband
+Saleh model). No AM-PM: there is no separate envelope phase to modulate when operating
+directly on a real, signed waveform.
+
+`from_op1db_oip3()` works identically to the complex-baseband case (same spec-dict keys
+via `registry.py`'s `'saleh'` model string, dispatched by `mode`), and the same
+`max_monotonic_amplitude` diagnostic and overdrive warning apply.
+
+This provides a second, bounded alternative to Volterra's `option='describing'` for
+real-axis mode — useful when the truncated-polynomial breakdown risk described in §5.1
+is a concern, at the cost of not being able to independently tune individual
+harmonic/IMD amplitudes the way a general Volterra kernel can.
 
 ---
 
@@ -434,22 +529,37 @@ The two are summed per realization before the QuTiP simulation.
 1. LOAD AND VALIDATE
    └─ Load SignalIntegrity schematic + nonlinear_nodes + noise_nodes annotations
    └─ Validate: VoltageSource present, QUBIT_PROBE present
+   └─ Validate: every nonlinear_nodes / noise_nodes key names a probe that
+      exists in the schematic (§3.2) — raises ValueError listing any that
+      don't, before any transfer functions are extracted
    └─ Check mode: complex_baseband (default) or real_axis
 
-2. SETUP: TRANSFER FUNCTION EXTRACTION
-   └─ Extract H_k(ω) for each segment between adjacent NL probe pairs
-      (Source → NL_1, NL_1 → NL_2, ..., NL_n → QUBIT_PROBE)
-   └─ Extract H_{j→qubit}(ω) for each noise node j: full transfer function
+2. SETUP: TRANSFER FUNCTION EXTRACTION (waveform-agnostic, §3.3)
+   └─ NL_1..NL_n order = nonlinear_nodes dict key order (§3.5)
+   └─ Extract raw H_k(ω) for each segment between adjacent NL probe pairs
+      (Source → NL_1, NL_1 → NL_2, ..., NL_n → QUBIT_PROBE) — frequency
+      domain only, no sample rate/carrier/mode involved yet
+   └─ Extract raw H_{j→qubit}(ω) for each noise node j: full transfer function
       from node j to QUBIT_PROBE, regardless of NL segmentation
-   └─ Mode conversion:
-      - Complex baseband: shift all H(ω) → H̃(f) = H(f + f_carrier)
-      - Real-axis: use H(ω) directly
-   └─ Run checks: isolation between NL nodes, harmonic suppression (baseband mode),
-      sample rate adequacy, small-signal gain normalization of each NL node (§3.6)
+   └─ Run checks that only need frequency-domain data: isolation between
+      NL nodes, harmonic suppression (baseband mode), small-signal gain
+      normalization of each NL node (§3.6)
 
-3. SETUP: BUILD SOURCE WAVEFORM
-   └─ Complex baseband: SI Waveform envelope used directly as ũ(t)
-   └─ Real-axis: modulate envelope onto carrier → v(t) = Re{ũ(t)·exp(j2πf_c·t)}
+3. SETUP: BUILD SOURCE WAVEFORM AND CONVERT TO IMPULSE RESPONSES (§3.3)
+   └─ Determine the sample rate + waveform this run actually convolves at:
+      - Complex baseband: source.fs (the envelope's own rate); v(t) = ũ(t)
+        used directly
+      - Real-axis: the schematic's own native rate (2× top frequency of its
+        sweep); the drive envelope is resampled to match it and modulated
+        onto the carrier → v(t) = Re{ũ_resampled(t)·exp(j2πf_c·t)}; sample
+        rate adequacy (harmonic tracking) is checked against this native
+        rate, not the envelope's original fs
+   └─ Convert each raw H_k(ω)/H_{j→qubit}(ω) to a time-domain impulse
+      response h_k(τ)/h_{j→qubit}(τ) at that rate:
+      - Complex baseband: shift H(ω) → H̃(f) = H(f + f_carrier), interpolated
+        onto the envelope's grid, then IFFT
+      - Real-axis: IFFT directly at the schematic's native rate — no
+        interpolation needed
 
 4. NONLINEAR PASS  [deterministic — runs once]
 
@@ -460,8 +570,8 @@ The two are summed per realization before the QuTiP simulation.
    For each segment k in propagation order:
       i.  Convolve: v_nl(t) = h_k(τ) * v_nl(t)
       ii. If NL node k: apply nonlinearity
-          - Complex baseband: AM-AM/AM-PM or memory polynomial on ũ_nl(t)
-          - Real-axis: Volterra series on v_nl(t)
+          - Complex baseband: AM-AM/AM-PM on ũ_nl(t)
+          - Real-axis: Volterra series or the real-axis Saleh variant on v_nl(t)
 
    Result: v_nl_qubit(t)  — deterministic distorted waveform at qubit plane
 
@@ -571,9 +681,7 @@ si_qfi/
 │
 ├── nonlinear/
 │   ├── base.py                # NonlinearNode base class
-│   ├── saleh.py               # Saleh AM-AM/AM-PM (complex baseband)
-│   ├── amam_ampm.py           # Tabulated AM-AM/AM-PM with spline (complex baseband)
-│   ├── memory_polynomial.py   # Memory polynomial (complex baseband)
+│   ├── saleh.py               # SalehModel (complex baseband) + SalehRealAxisModel (real-axis)
 │   ├── volterra.py            # Volterra series, real-axis mode only
 │   └── registry.py            # Map NL probe label → model
 │
@@ -617,8 +725,13 @@ si_qfi/
 ```python
 import si_qfi as siq
 
-# 1. Load schematic
+# 1. Load schematic. qubit_probe_label / source_label default to
+#    'VQubit' / 'VSource' (§3.1) -- pass overrides if your schematic uses
+#    different probe/source ref names.
 schematic = siq.load_schematic("qubit_driveline.si")
+# schematic = siq.load_schematic("qubit_driveline.si",
+#                                 qubit_probe_label="MyQubitProbe",
+#                                 source_label="MySource")
 
 # 2. Source waveform (SI Waveform carries duration and sample rate)
 source = siq.SourceWaveform(carrier_freq_ghz=5.0, envelope=drag_si_waveform)
@@ -638,7 +751,8 @@ nonlinear_nodes = {
 }
 
 # Real-axis mode: Volterra
-# small_signal_gain is omitted here and defaults to 1.0, consistent with §3.6.
+# a1 (order-1 coefficient) is always fixed at 1.0 -- not a constructor
+# parameter -- consistent with §3.6.
 nonlinear_nodes_realaxis = {
     "NL_AMP1_OUT": {
         "model": "volterra",
@@ -720,8 +834,7 @@ siq.compare_modes(result, result_real)   # Warns if modes disagree beyond tolera
 - Isolation, harmonic, and sample rate diagnostic checks
 
 ### Phase 2 — Full Nonlinearity
-- Tabulated AM-AM/AM-PM, memory polynomial (complex baseband)
-- Real-axis mode: Volterra series, full RF propagation, demodulation before QuTiP
+- Real-axis mode: Volterra series and the real-axis Saleh variant, full RF propagation, demodulation before QuTiP
 - Multi-segment propagation (N NL nodes)
 - Lindblad secondary mode (T1/T2)
 - Cross-validation utility: compare_modes()
@@ -738,7 +851,7 @@ siq.compare_modes(result, result_real)   # Warns if modes disagree beyond tolera
 ## 14. Open Questions
 
 1. **Volterra kernel parameterization from P1dB/IP3:** The diagonal-kernel approximation
-   (Option C in §5.4) fits h₃ from P1dB and IP3 using the cubic kernel result. This
+   (Option C in §5.3) fits h₃ from P1dB and IP3 using the cubic kernel result. This
    assumes odd-symmetric nonlinearity (h₂ = 0). Confirm this is adequate for the
    amplifier types expected in superconducting qubit drive chains, or whether even-order
    terms need a separate IP2 specification.
@@ -776,4 +889,4 @@ siq.compare_modes(result, result_real)   # Warns if modes disagree beyond tolera
 
 *Document maintained by: [Author]*
 *Last updated: July 2026*
-*Status: Pre-development / Seed document v0.5*
+*Status: Pre-development / Seed document v0.10*

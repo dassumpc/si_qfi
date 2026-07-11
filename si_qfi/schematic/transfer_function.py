@@ -2,49 +2,85 @@
 si_qfi.schematic.transfer_function
 ====================================
 Extract voltage transfer functions H(f) between adjacent probe pairs from a
-SignalIntegrity schematic, and convert to time-domain impulse responses h(τ).
+SignalIntegrity schematic. Extraction is waveform-agnostic — it depends only
+on the schematic, never on any particular drive waveform's sample rate,
+carrier frequency, or mode. Converting a raw TransferFunction to a
+time-domain impulse response h(τ) (which does need those things) is a
+separate, later step: see compute_impulse_response().
 
-Two output forms:
-  - Complex baseband: H̃(f) = H(f + f_carrier), impulse response h̃(τ)
-  - Real-axis: H(f) directly, impulse response h(τ) (real-valued)
+SI API notes (verified against the installed SignalIntegrity source, not
+guessed)
+---------------------------------------------------------------------------
+There is no `si_app.SParameters()` method. Two real methods exist, and which
+applies depends on schematic topology:
+  - `si_app.CalculateSParameters()` — only works for schematics built from
+    `Port`-type devices with no `Output` devices (network-analyzer style).
+  - `si_app.TransferParameters()` — works for VoltageSource + Output
+    schematics, which is SI-QFI's convention. This is the one used here.
+    Returns a `Result` (dict subclass) with keys 'source names',
+    'output waveform labels', 'transfer matrices'. `Result.FrequencyResponse
+    (from_name, to_name)` looks up a `FrequencyResponse` by name directly —
+    no manual port-index bookkeeping needed.
 
-# --- CURSOR NOTE (HIGH PRIORITY) ---
-# This is the most critical SI API integration point in the codebase.
-#
-# The standard SI pattern for computing transfer functions between ports:
-#
-#   from SignalIntegrity.App.SignalIntegrityAppHeadless import (
-#       SignalIntegrityAppHeadless,
-#   )
-#   app = SignalIntegrityAppHeadless()
-#   app.OpenProjectFile("myschematic.si")
-#
-#   # Get S-parameters of the full schematic:
-#   (sp, name) = app.SParameters()
-#   # sp is a SParameters object with:
-#   #   sp.m  — number of ports
-#   #   sp.f() — frequency list
-#   #   sp[i][j] — S_{i,j} at each frequency (list of complex values)
-#   #
-#   # Transfer function from port j to port i:
-#   #   H_{ij}(f) = S_{ij}(f)
-#   #
-#   # Port numbering corresponds to the order probes appear in the schematic.
-#   # Need to map probe labels → port indices.
-#   # Check: app.schematic.deviceList ordering or a dedicated port-name method.
-#
-#   # Alternative: if SI supports extracting a sub-network between two named probes,
-#   # use that directly. Check SI documentation / source for port naming API.
-# -------------------
+TransferParameters() only exposes *source-referenced* responses (source →
+each probe), never probe-to-probe directly. To get H(f) for a segment
+between two probes A → B where neither is the source, this module computes:
+
+    H_{A→B}(f) = H_{source→B}(f) / H_{source→A}(f)     [see _extract_single_tf]
+
+which is exact by linearity (both are responses of the same linear network
+to the same source). TransferParameters() re-simulates the whole network, so
+its result is cached per si_app (see _get_transfer_parameters) rather than
+re-fetched for every segment.
+
+Reuse of SI's own FrequencyResponse machinery
+---------------------------------------------------------------------------
+`Result.FrequencyResponse()` returns a real SI `FrequencyResponse` object,
+which already implements `/` (frequency-domain division, used for the ratio
+above) and `.ImpulseResponse(td)` (real-axis mode's impulse response — see
+compute_impulse_response()). TransferFunction stores this object as
+`si_frequency_response` (an untyped/`Any` field — no SI import needed to
+declare it) and derives `freqs`/`H` from it as properties rather than
+storing them separately — TransferFunction is always constructed from a
+schematic (see _extract_single_tf), so there is never a second, independent
+source for this data to reconcile. TransferFunction deliberately does *not*
+inherit from FrequencyResponse, though: that would require importing SI at
+module level here, and this module is imported unconditionally by
+simulation/engine.py → si_qfi/__init__.py, so it would make SignalIntegrity
+a hard dependency just to `import si_qfi` — breaking the "core math works
+without SI installed" property every other SI touchpoint in this codebase
+preserves by importing SI lazily inside function bodies instead.
+
+Extraction vs. impulse response (PRD §3.3)
+---------------------------------------------------------------------------
+extract_all_transfer_functions() / extract_noise_transfer_functions() return
+raw, frequency-domain-only TransferFunction objects (h/dt left as None).
+Converting to a time-domain impulse response — which requires a target
+sample rate, a mode, and (for baseband) a carrier frequency — is the
+caller's job, via compute_impulse_response(), done once a concrete
+SourceWaveform is available (the engine does this). This keeps extraction
+coupled only to the schematic, never to any specific drive waveform.
+
+The two modes disagree on *whose* sample rate governs the impulse response:
+  - Real-axis mode: the schematic has one natural, waveform-independent
+    sample rate (native_sample_rate() below, derived from the schematic's
+    own frequency sweep — matches SI's own CalculationProperties.
+    UserSampleRate). h(τ) is computed directly at that rate (no
+    interpolation needed), and the *drive waveform* is resampled to match
+    it (SourceWaveform.rf_waveform_at()) — mirroring SI's own
+    Waveform.Adapt() idiom for "fit a waveform to a target time grid".
+  - Complex baseband mode: there is no schematic-intrinsic baseband rate —
+    it's fundamentally a pulse-bandwidth choice (PRD §4.1's whole point is
+    running two orders of magnitude below real-axis rate). So baseband mode
+    keeps interpolating H(f) onto the target grid implied by the envelope's
+    own fs/carrier, as before.
 """
 
 from __future__ import annotations
 
 import numpy as np
-import warnings
-from dataclasses import dataclass
-from typing import Any
-from scipy.signal import fftconvolve
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 
 @dataclass
@@ -52,95 +88,90 @@ class TransferFunction:
     """
     Voltage transfer function between two schematic nodes.
 
+    Always constructed from a schematic (see _extract_single_tf) — there is
+    no supported way to build one without a real SI FrequencyResponse, so
+    freqs/H are derived from si_frequency_response rather than stored
+    independently (see module docstring).
+
     Attributes
     ----------
     label_in : str   Source probe label (input node).
     label_out : str  Destination probe label (output node).
-    freqs : np.ndarray, float64, shape (F,)   Frequency array (Hz).
-    H : np.ndarray, complex128, shape (F,)    Complex transfer function.
-    h : np.ndarray, float64 or complex128     Time-domain impulse response.
-    dt : float  Sample interval of h (seconds).
+    si_frequency_response : Any
+        The native SI FrequencyResponse this was extracted from (set by
+        _extract_single_tf). Untyped so this module never needs to import
+        SI's class to declare the field. freqs/H (below) are computed from
+        it on access; compute_impulse_response() also uses its
+        .ImpulseResponse() directly for real-axis mode. repr suppressed —
+        it would otherwise dump the entire complex-value list.
+    h : np.ndarray or None
+        Time-domain impulse response. None until compute_impulse_response()
+        has been called on this object (extraction alone never populates
+        this — see module docstring).
+    dt : float or None
+        Sample interval of h (seconds). None until compute_impulse_response().
     """
     label_in: str
     label_out: str
-    freqs: np.ndarray
-    H: np.ndarray      # frequency domain
-    h: np.ndarray      # time domain
-    dt: float
+    si_frequency_response: Any = field(repr=False)
+    h: Optional[np.ndarray] = None     # time domain — set by compute_impulse_response()
+    dt: Optional[float] = None
+
+    @property
+    def freqs(self) -> np.ndarray:
+        """Frequency array (Hz), float64, shape (F,)."""
+        return np.array(self.si_frequency_response.Frequencies(), dtype=float)
+
+    @property
+    def H(self) -> np.ndarray:
+        """Complex transfer function, complex128, shape (F,)."""
+        return np.array(self.si_frequency_response.Response(), dtype=complex)
 
 
 def extract_all_transfer_functions(
     schematic,           # SISchematic
-    source_waveform,     # SourceWaveform
-    mode: str,
+    nl_labels: list[str],
 ) -> dict[tuple[str, str], TransferFunction]:
     """
-    Extract transfer functions for all required node pairs.
+    Extract raw (frequency-domain-only) transfer functions for all required
+    segment pairs.
 
     Node pairs needed:
-      Segment pairs: (SOURCE, NL_1), (NL_1, NL_2), ..., (NL_n, QUBIT_PROBE)
-      Noise pairs:   (noise_node_j, QUBIT_PROBE) for each j — full path
+      Segment pairs: (source_label, NL_1), (NL_1, NL_2), ...,
+                      (NL_n, qubit_probe_label)
 
     The engine calls this once during setup. Results are cached and reused
-    for all realizations.
+    for all realizations. Returned TransferFunctions have h=None, dt=None —
+    call compute_impulse_response() to populate those once a target sample
+    rate/mode/carrier are known (see module docstring).
 
     Parameters
     ----------
     schematic : SISchematic
-        Loaded schematic object (contains si_app).
-    source_waveform : SourceWaveform
-        Used to determine sample rate and carrier frequency.
-    mode : str
-        'complex_baseband' or 'real_axis'.
+        Loaded schematic object (contains si_app, source_label,
+        qubit_probe_label).
+    nl_labels : list of str
+        Nonlinear node probe labels, in propagation order (source_label →
+        nl_labels → qubit_probe_label). This is the `nonlinear` annotation
+        dict's key order, as validated by
+        schematic.loader.validate_node_labels() — it is the single source of
+        truth for segmentation, not anything derived from the schematic
+        itself.
 
     Returns
     -------
-    dict mapping (label_in, label_out) → TransferFunction.
-
-    # --- CURSOR NOTE ---
-    # Implementation outline:
-    #
-    # 1. Call si_app.SParameters() to get the full S-parameter matrix.
-    # 2. Build a mapping of probe_label → port_index from the schematic.
-    # 3. For each required (label_in, label_out) pair:
-    #    a. Look up port indices i_in, i_out.
-    #    b. Extract H(f) = sp[i_out][i_in] at each frequency.
-    #    c. If mode == 'complex_baseband': shift to baseband (§3.3 of PRD).
-    #    d. IFFT to get impulse response h(τ).
-    # 4. Return dict of TransferFunction objects.
-    #
-    # Frequency array from SI:
-    #   freqs = sp.f()   # list → np.array
-    # Transfer function (voltage gain, not power):
-    #   H_ij = np.array([sp[f_idx][i_out][i_in] for f_idx in range(len(freqs))])
-    #   (confirm indexing order: sp[port_out][port_in] vs sp[port_in][port_out])
-    # -------------------
+    dict mapping (label_in, label_out) → TransferFunction (raw).
     """
-    # Build list of all required pairs
-    nl_labels = schematic.nl_probe_labels
-    source_label = "SOURCE"       # synthetic label for the voltage source port
-    qubit_label = "QUBIT_PROBE"
+    source_label = schematic.source_label
+    qubit_label = schematic.qubit_probe_label
 
-    # Segment pairs for NL pass
-    all_labels = [source_label] + nl_labels + [qubit_label]
+    all_labels = [source_label] + list(nl_labels) + [qubit_label]
     segment_pairs = list(zip(all_labels[:-1], all_labels[1:]))
-
-    # Noise pairs: source → each possible noise injection point → QUBIT_PROBE
-    # These span potentially multiple segments; we extract them as full paths.
-    # For now we return segment pairs only; the engine composes for longer paths.
-    # --- CURSOR NOTE ---
-    # For noise propagation we need h_{j→qubit} directly (not composed from segments).
-    # Extract these as separate port pairs from the full schematic S-parameters.
-    # The full S-parameter matrix gives us any-to-any transfer function directly.
-    # -------------------
 
     result: dict[tuple[str, str], TransferFunction] = {}
 
     for (lin, lout) in segment_pairs:
-        tf = _extract_single_tf(
-            schematic.si_app, lin, lout,
-            source_waveform.fs, mode, source_waveform.carrier_freq_hz
-        )
+        tf = _extract_single_tf(schematic.si_app, lin, lout, source_label)
         result[(lin, lout)] = tf
 
     return result
@@ -149,109 +180,179 @@ def extract_all_transfer_functions(
 def extract_noise_transfer_functions(
     schematic,
     noise_node_labels: list[str],
-    source_waveform,
-    mode: str,
-) -> dict[str, np.ndarray]:
+) -> dict[str, TransferFunction]:
     """
-    Extract impulse responses h_{j→qubit}(τ) for each noise node j.
+    Extract raw (frequency-domain-only) transfer functions h_{j→qubit} for
+    each noise node j.
 
     Parameters
     ----------
     schematic : SISchematic
     noise_node_labels : list of str
         Labels of noise-annotated nodes (any schematic node, not just NL probes).
-    source_waveform : SourceWaveform
-    mode : str
 
     Returns
     -------
-    dict mapping noise_node_label → impulse response array h_{j→qubit}.
+    dict mapping noise_node_label → TransferFunction (raw; h=None, dt=None
+    until compute_impulse_response() is called — see module docstring).
     """
-    result: dict[str, np.ndarray] = {}
+    source_label = schematic.source_label
+    qubit_label = schematic.qubit_probe_label
+
+    result: dict[str, TransferFunction] = {}
     for label in noise_node_labels:
-        tf = _extract_single_tf(
-            schematic.si_app, label, "QUBIT_PROBE",
-            source_waveform.fs, mode, source_waveform.carrier_freq_hz
-        )
-        result[label] = tf.h
+        result[label] = _extract_single_tf(schematic.si_app, label, qubit_label, source_label)
     return result
+
+
+def compute_impulse_response(
+    tf: TransferFunction,
+    mode: str,
+    *,
+    fs: Optional[float] = None,
+    carrier_hz: Optional[float] = None,
+) -> TransferFunction:
+    """
+    Convert a raw (frequency-domain-only) TransferFunction into one with a
+    time-domain impulse response.
+
+    This is the deferred step described in the module docstring: extraction
+    never needs fs/mode/carrier_hz, only this conversion does — call it once
+    a concrete SourceWaveform's fs/carrier are known (the engine does this,
+    per-run, not per-schematic).
+
+    Real-axis mode ignores fs entirely: it reuses SI's own
+    FrequencyResponse.ImpulseResponse() (via tf.si_frequency_response) with
+    no target rate, so SI derives its own native sample rate directly from
+    the FrequencyResponse's own frequency grid — not a hand-rolled IRFFT,
+    and not the caller-supplied fs, which (per native_sample_rate()) would
+    only ever equal that same native rate anyway. carrier_hz is also unused
+    in this mode (real-axis has no baseband shift to apply). fs/carrier_hz
+    are keyword-only and optional for this reason.
+
+    Complex baseband mode still needs both explicitly — fs to set the
+    baseband grid the envelope's own bandwidth implies, carrier_hz for the
+    H(f) → H(f+carrier) shift (PRD §3.3) — and raises ValueError if either
+    is missing.
+
+    Returns a new TransferFunction with h/dt populated; freqs/H are
+    unchanged (still derived from the same si_frequency_response — see
+    _extract_single_tf).
+    """
+    if mode == "real_axis":
+        ir = tf.si_frequency_response.ImpulseResponse()
+        h = np.asarray(ir.Values(), dtype=float)
+        dt = 1.0 / float(ir.td.Fs)
+    elif mode == "complex_baseband":
+        if fs is None or carrier_hz is None:
+            raise ValueError(
+                "compute_impulse_response(mode='complex_baseband') requires "
+                "both fs and carrier_hz."
+            )
+        h, _unused_freq_grid, dt = _tf_to_baseband_impulse(tf.freqs, tf.H, fs, carrier_hz)
+    else:
+        raise ValueError(f"mode must be 'complex_baseband' or 'real_axis', got {mode!r}.")
+
+    return TransferFunction(
+        label_in=tf.label_in, label_out=tf.label_out,
+        si_frequency_response=tf.si_frequency_response, h=h, dt=dt,
+    )
+
+
+def native_sample_rate(tf: TransferFunction) -> float:
+    """
+    The real-axis-mode sample rate implied by the schematic's own frequency
+    sweep: 2x the top frequency in tf.freqs (Nyquist for the associated
+    real time-domain signal — matches SI's own CalculationProperties.
+    UserSampleRate for an evenly-spaced sweep from 0 to EndFrequency).
+
+    Used in real-axis mode so the schematic's own resolution determines the
+    impulse response and convolution grid; the drive waveform is resampled
+    to match it (SourceWaveform.rf_waveform_at()) rather than the transfer
+    function being interpolated onto the waveform's own fs — see module
+    docstring.
+    """
+    return 2.0 * float(tf.freqs[-1])
+
+
+def _get_transfer_parameters(si_app: Any):
+    """
+    Call si_app.TransferParameters() once and cache the Result on si_app
+    (TransferParameters() re-simulates the whole network, and this is called
+    once per segment/noise-node — caching avoids re-simulating for each).
+
+    Raises
+    ------
+    RuntimeError
+        If TransferParameters() fails (e.g. equations invalid, or the
+        schematic doesn't have the VoltageSource + Output topology it
+        requires — see module docstring).
+    """
+    cached = getattr(si_app, "_si_qfi_transfer_result", None)
+    if cached is not None:
+        return cached
+    result = si_app.TransferParameters()
+    if not result or result.get("transfer matrices") is None:
+        raise RuntimeError(
+            "SignalIntegrity TransferParameters() failed. Check that the "
+            "schematic has a VoltageSource and Output-type probes, no Port "
+            "devices, and no unresolved equation errors."
+        )
+    si_app._si_qfi_transfer_result = result
+    return result
+
+
+def _source_referenced_response(si_app: Any, source_label: str, label: str):
+    """
+    Return the FrequencyResponse from source_label to `label`, as computed
+    by TransferParameters(). Raises a clear ValueError if either name isn't
+    found (Result.FrequencyResponse would otherwise raise a bare ValueError
+    from list.index()).
+    """
+    result = _get_transfer_parameters(si_app)
+    if source_label not in result["source names"]:
+        raise ValueError(
+            f"Source '{source_label}' not found. Available sources: "
+            f"{result['source names']}."
+        )
+    if label not in result["output waveform labels"]:
+        raise ValueError(
+            f"Probe '{label}' not found. Available probes: "
+            f"{result['output waveform labels']}."
+        )
+    return result.FrequencyResponse(source_label, label)
 
 
 def _extract_single_tf(
     si_app: Any,
     label_in: str,
     label_out: str,
-    fs: float,
-    mode: str,
-    carrier_hz: float,
+    source_label: str,
 ) -> TransferFunction:
     """
-    Extract a single transfer function H(f) between two named probes.
+    Extract a single raw (frequency-domain-only) transfer function
+    H(f) = V_out(label_out)/V_in(label_in). h/dt are left as None — see
+    compute_impulse_response() and the module docstring.
 
-    # --- CURSOR NOTE ---
-    # This is where the SI API call lives. Implement:
-    #
-    #   (sp, name) = si_app.SParameters()
-    #   freqs = np.array(sp.f())
-    #   i_in  = _label_to_port_index(si_app, label_in)
-    #   i_out = _label_to_port_index(si_app, label_out)
-    #   H_raw = np.array([sp[k][i_out][i_in] for k in range(len(freqs))], dtype=complex)
-    #   # Note: sp indexing may be sp[freq_index][port_out][port_in] — verify.
-    #
-    # Then call _to_impulse_response(freqs, H_raw, fs, mode, carrier_hz).
-    # -------------------
+    TransferParameters() only exposes source-referenced responses, so this
+    is computed as (see module docstring):
+        label_in == source_label:  fr = FrequencyResponse(source_label → label_out)
+        otherwise:                 fr = FrequencyResponse(source_label → label_out)
+                                       / FrequencyResponse(source_label → label_in)
+    using SI's own FrequencyResponse division (FrequencyDomain.__truediv__),
+    which returns another proper FrequencyResponse — stored on the result as
+    si_frequency_response for compute_impulse_response()'s real-axis path to
+    reuse (and for the freqs/H properties to derive from).
     """
-    raise NotImplementedError(
-        f"_extract_single_tf('{label_in}' → '{label_out}'): "
-        "Implement using SignalIntegrity SParameters API. See CURSOR NOTE."
-    )
+    fr_out = _source_referenced_response(si_app, source_label, label_out)
 
-
-def _label_to_port_index(si_app: Any, label: str) -> int:
-    """
-    Map a probe label to its port index in the SI S-parameter matrix.
-
-    # --- CURSOR NOTE ---
-    # Port ordering in SI's S-parameter output matches the order probes appear
-    # in the schematic device list. Verify by:
-    #   for i, device in enumerate(si_app.schematic.deviceList):
-    #       print(i, device.partname, device.propertiesByName.get('ref', '?'))
-    # Build the mapping once and cache it.
-    # -------------------
-    """
-    raise NotImplementedError(
-        f"_label_to_port_index('{label}'): implement using SI schematic device list."
-    )
-
-
-def _to_impulse_response(
-    freqs: np.ndarray,
-    H: np.ndarray,
-    fs_target: float,
-    mode: str,
-    carrier_hz: float,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Convert a frequency-domain transfer function to a time-domain impulse response.
-
-    Parameters
-    ----------
-    freqs : np.ndarray   Frequency array from SI (Hz), one-sided (f ≥ 0).
-    H : np.ndarray       Complex transfer function at freqs.
-    fs_target : float    Target sample rate of the time-domain output (Hz).
-    mode : str           'complex_baseband' or 'real_axis'.
-    carrier_hz : float   Carrier frequency (Hz) for baseband shifting.
-
-    Returns
-    -------
-    h : np.ndarray   Time-domain impulse response.
-    freqs_out : np.ndarray  Frequency array used for IFFT.
-    dt : float   Sample interval of h.
-    """
-    if mode == "complex_baseband":
-        return _tf_to_baseband_impulse(freqs, H, fs_target, carrier_hz)
+    if label_in == source_label:
+        fr = fr_out
     else:
-        return _tf_to_realaxis_impulse(freqs, H, fs_target)
+        fr_in = _source_referenced_response(si_app, source_label, label_in)
+        fr = fr_out / fr_in
+
+    return TransferFunction(label_in=label_in, label_out=label_out, si_frequency_response=fr)
 
 
 def _tf_to_baseband_impulse(
@@ -270,34 +371,32 @@ def _tf_to_baseband_impulse(
     # Build a uniformly-spaced frequency grid at the target sample rate
     N = int(round(fs / (freqs[1] - freqs[0]))) if len(freqs) > 1 else 1024
     N = max(N, 64)
-    df = fs / N
-    f_bb = np.fft.fftfreq(N, d=1.0 / fs)   # two-sided baseband freqs
+    f_bb = np.fft.fftfreq(N, d=1.0 / fs)   # two-sided baseband freqs, FFT-bin order
 
-    # Interpolate H(f) onto the shifted grid: H̃(f_bb) = H(f_bb + carrier)
+    # Interpolate H(f) onto the shifted grid: H̃(f_bb) = H(f_bb + carrier).
+    # f_bb (and therefore H_tilde) is already in FFT-native bin order (index 0
+    # = baseband DC, matching np.fft.fftfreq's own convention) -- do NOT
+    # ifftshift it before the ifft below, that would assume a centered/
+    # ascending frequency order and rotate every bin by N/2.
     f_rf = f_bb + carrier_hz   # RF frequencies corresponding to baseband grid
     H_tilde = _interpolate_tf(freqs, H, f_rf)
 
-    # IFFT → complex baseband impulse response
-    h_tilde = np.fft.ifft(np.fft.ifftshift(H_tilde)) * N * df
+    # IFFT -> complex baseband impulse response (discrete convolution kernel
+    # convention, same as real-axis mode: sum(h) == H(f=0-equivalent), no
+    # extra dt/fs scaling -- engine.py's fftconvolve(v, h) expects this).
+    #
+    # fftshift the result so index 0 is the most-negative representable
+    # delay and the array is centered around tau=0 -- this matches SI's own
+    # FrequencyResponse.ImpulseResponse() convention exactly (see its source:
+    # it computes the raw ifft, then does `Y = Y[K//2:] + Y[:K//2]`, i.e. an
+    # fftshift). Without this, real-axis mode's h (SI-native, centered) and
+    # baseband mode's h (this function, previously left in native FFT-bin
+    # order) would use two different conventions for "where is tau=0",
+    # even though engine.py now convolves both the same way (full, untouched
+    # -- no truncation, no offset bookkeeping -- see engine.py's
+    # _nonlinear_pass). fftshift is a pure reordering (sum(h) is unaffected).
+    h_tilde = np.fft.fftshift(np.fft.ifft(H_tilde))
     return h_tilde.astype(complex), f_bb, 1.0 / fs
-
-
-def _tf_to_realaxis_impulse(
-    freqs: np.ndarray,
-    H: np.ndarray,
-    fs: float,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Build the full two-sided (real-axis) transfer function and IFFT to get h(τ).
-    """
-    N = int(round(fs / (freqs[1] - freqs[0]))) if len(freqs) > 1 else 1024
-    N = max(N, 64)
-    df = fs / N
-    f_full = np.fft.rfftfreq(N, d=1.0 / fs)
-
-    H_interp = _interpolate_tf(freqs, H, f_full)
-    h = np.fft.irfft(H_interp, n=N)
-    return h.astype(float), f_full, 1.0 / fs
 
 
 def _interpolate_tf(

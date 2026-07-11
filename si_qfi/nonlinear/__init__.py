@@ -1,13 +1,10 @@
-from .saleh import SalehModel
-from .amam_ampm import TabulatedAMAM
-from .memory_polynomial import MemoryPolynomial
+from .saleh import SalehModel, SalehRealAxisModel
 from .volterra import VolterraModel
 from .registry import build_nonlinear_nodes
 
 __all__ = [
     "SalehModel",
-    "TabulatedAMAM",
-    "MemoryPolynomial",
+    "SalehRealAxisModel",
     "VolterraModel",
     "build_nonlinear_nodes",
 ]

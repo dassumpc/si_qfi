@@ -6,10 +6,9 @@ of probe label → NonlinearNode instance.
 
 Supported model strings
 -----------------------
-  'saleh'            → SalehModel
-  'amam_ampm'        → TabulatedAMAM
-  'memory_polynomial'→ MemoryPolynomial
-  'volterra'         → VolterraModel
+  'saleh'      → SalehModel (mode='complex_baseband') or SalehRealAxisModel
+                 (mode='real_axis') -- see nonlinear/saleh.py.
+  'volterra'   → VolterraModel
 
 All keys that are not recognised model parameters are passed through as kwargs
 to the model constructor so that future models can add their own parameters
@@ -23,7 +22,13 @@ nonlinear/base.py). After building each node, build_nonlinear_nodes() checks
 node.small_signal_gain and warns if it deviates from unity by more than
 _SMALL_SIGNAL_GAIN_TOLERANCE_DB — a likely sign the device's real gain was
 fit directly into the nonlinear model and will be double-counted if that
-device is also represented in the schematic.
+device is also represented in the schematic. Note: 'saleh' built via
+from_op1db_oip3() always has alpha_a=1.0 (it takes no gain argument at all,
+see nonlinear/saleh.py), and 'volterra' built via option='describing' always
+has a1=1.0 (also takes no gain argument -- see nonlinear/volterra.py), so
+this check only ever fires for 'saleh' built via the direct
+alpha_a/beta_a/... constructor path below, or for 'volterra' built via
+option='diagonal' with user-supplied coefficients.
 """
 
 from __future__ import annotations
@@ -34,12 +39,10 @@ from typing import Any, Optional
 import numpy as np
 
 from .base import NonlinearNode
-from .saleh import SalehModel
-from .amam_ampm import TabulatedAMAM
-from .memory_polynomial import MemoryPolynomial
+from .saleh import SalehModel, SalehRealAxisModel
 from .volterra import VolterraModel
 
-_SMALL_SIGNAL_GAIN_TOLERANCE_DB = 3.0
+_SMALL_SIGNAL_GAIN_TOLERANCE_DB = 1.0
 
 
 def build_nonlinear_nodes(
@@ -70,10 +73,6 @@ def build_nonlinear_nodes(
     """
     nodes: dict[str, NonlinearNode] = {}
     for label, spec in nonlinear_annotation.items():
-        if not label.startswith("NL_"):
-            raise ValueError(
-                f"Nonlinear node label '{label}' must start with 'NL_'."
-            )
         spec = dict(spec)   # copy so we can pop 'model'
         model_name = spec.pop("model", None)
         if model_name is None:
@@ -126,44 +125,55 @@ def _build_model(
     """Instantiate a single NonlinearNode from its spec dict."""
 
     if model_name == "saleh":
-        node = _build_saleh(params)
-    elif model_name == "amam_ampm":
-        node = _build_amam_ampm(params)
-    elif model_name == "memory_polynomial":
-        node = _build_memory_polynomial(params)
+        node = _build_saleh(params, mode)
     elif model_name == "volterra":
         node = _build_volterra(params)
     else:
         raise ValueError(
             f"Unknown nonlinear model '{model_name}' for node '{label}'. "
-            f"Supported: 'saleh', 'amam_ampm', 'memory_polynomial', 'volterra'."
+            f"Supported: 'saleh', 'volterra'."
         )
 
     # Validate mode compatibility
     if mode == "complex_baseband" and not node.supports_baseband:
         raise ValueError(
             f"Model '{model_name}' for node '{label}' does not support "
-            f"complex_baseband mode. Use 'saleh', 'amam_ampm', or 'memory_polynomial'."
+            f"complex_baseband mode. Use 'saleh'."
         )
     if mode == "real_axis" and not node.supports_real_axis:
         raise ValueError(
             f"Model '{model_name}' for node '{label}' does not support "
-            f"real_axis mode. Use 'volterra'."
+            f"real_axis mode. Use 'volterra' or 'saleh' (mode='real_axis' "
+            f"builds the SalehRealAxisModel variant)."
         )
 
     return node
 
 
-def _build_saleh(p: dict) -> SalehModel:
-    if "p1db_amplitude" in p and "ip3_amplitude" in p:
-        return SalehModel.from_p1db_ip3(
-            p1db_amplitude=p["p1db_amplitude"],
-            ip3_amplitude=p["ip3_amplitude"],
-            small_signal_gain=p.get("small_signal_gain", 1.0),
+def _build_saleh(p: dict, mode: str):
+    """
+    Build a SalehModel (mode='complex_baseband') or SalehRealAxisModel
+    (mode='real_axis') -- same spec-dict keys either way (see
+    nonlinear/saleh.py for how the two differ).
+    """
+    cls = SalehRealAxisModel if mode == "real_axis" else SalehModel
+    if "op1db_amplitude" in p or "oip3_amplitude" in p:
+        if "small_signal_gain" in p:
+            raise ValueError(
+                "'saleh' built from op1db_amplitude/oip3_amplitude takes no "
+                "small_signal_gain -- it is always a purely output-referred "
+                "nonlinearity with alpha_a=1.0 (see nonlinear/saleh.py). "
+                "Supply 'alpha_a'/'beta_a' directly instead if a non-unity "
+                "gain is genuinely needed (PRD §3.6, 'when this convention "
+                "does not apply')."
+            )
+        return cls.from_op1db_oip3(
+            op1db_amplitude=p.get("op1db_amplitude"),
+            oip3_amplitude=p.get("oip3_amplitude"),
             enable_am_pm=p.get("enable_am_pm", False),
             am_pm_peak_deg=p.get("am_pm_peak_deg", 0.0),
         )
-    return SalehModel(
+    return cls(
         alpha_a=p["alpha_a"],
         beta_a=p["beta_a"],
         alpha_phi=p.get("alpha_phi", 0.0),
@@ -171,41 +181,16 @@ def _build_saleh(p: dict) -> SalehModel:
     )
 
 
-def _build_amam_ampm(p: dict) -> TabulatedAMAM:
-    import numpy as np
-    return TabulatedAMAM(
-        amp_in=np.asarray(p["amam_curve"])[:, 0],
-        amp_out=np.asarray(p["amam_curve"])[:, 1],
-        phase_shift_rad=(
-            np.asarray(p["ampm_curve"])[:, 1] if "ampm_curve" in p else None
-        ),
-        extrapolate=p.get("extrapolate", "clip"),
-    )
-
-
-def _build_memory_polynomial(p: dict) -> MemoryPolynomial:
-    import numpy as np
-    if "coefficients" in p:
-        return MemoryPolynomial(
-            coefficients=np.asarray(p["coefficients"], dtype=complex),
-            orders=p.get("orders", [1, 3, 5]),
-        )
-    if "p1db_amplitude" in p and "ip3_amplitude" in p:
-        return MemoryPolynomial.from_p1db_ip3(
-            p1db_amplitude=p["p1db_amplitude"],
-            ip3_amplitude=p["ip3_amplitude"],
-            small_signal_gain=p.get("small_signal_gain", 1.0),
-            memory_depth=p.get("memory_depth", 0),
-            orders=p.get("orders", [1, 3, 5]),
-        )
-    raise ValueError(
-        "memory_polynomial requires either 'coefficients' or "
-        "'p1db_amplitude' + 'ip3_amplitude'."
-    )
-
-
 def _build_volterra(p: dict) -> VolterraModel:
     import numpy as np
+    if "small_signal_gain" in p:
+        raise ValueError(
+            "'volterra' takes no 'small_signal_gain' -- the describing/"
+            "diagonal k=1 coefficient (a1) is always fixed at 1.0 (purely "
+            "output-referred nonlinearity, no gain argument at all -- see "
+            "nonlinear/volterra.py module docstring, PRD §3.6). A device's "
+            "linear gain belongs in the SI schematic, not this model."
+        )
     option = p.get("option", "describing")
     return VolterraModel(
         h1=np.asarray(p["h1"]) if "h1" in p else None,
@@ -213,8 +198,7 @@ def _build_volterra(p: dict) -> VolterraModel:
         coefficients=np.asarray(p["coefficients"]) if "coefficients" in p else None,
         orders=p.get("orders", None),
         h3=np.asarray(p["h3"]) if "h3" in p else None,
-        p1db_amplitude=p.get("p1db_amplitude"),
-        ip3_amplitude=p.get("ip3_amplitude"),
-        small_signal_gain=p.get("small_signal_gain", 1.0),
+        op1db_amplitude=p.get("op1db_amplitude"),
+        oip3_amplitude=p.get("oip3_amplitude"),
         memory_depth=p.get("memory_depth", 5),
     )

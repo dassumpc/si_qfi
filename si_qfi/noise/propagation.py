@@ -37,8 +37,15 @@ class NoisePropagator:
         {probe_label: np.ndarray of h_{j→qubit}(τ)}.
         Keys must be a superset of noise_annotation keys.
         Supplied by the simulation engine after SI schematic analysis.
-    source_waveform : SourceWaveform
-        Needed for sample rate, n_samples, and mode-appropriate frequency grid.
+    n_samples : int
+        Number of samples per realization — the length of the waveform
+        actually used for convolution this run (real-axis mode may run at
+        the schematic's native sample rate rather than the drive waveform's
+        own, so this is passed explicitly rather than read off a
+        SourceWaveform — see source/waveform.py's rf_waveform_at()).
+    fs : float
+        Sample rate (Hz) actually used for convolution this run — same
+        reasoning as n_samples.
     mode : str
         'complex_baseband' or 'real_axis'.
     source_impedance_ohm : float
@@ -49,18 +56,18 @@ class NoisePropagator:
         self,
         noise_annotation: dict[str, dict[str, Any]],
         transfer_functions_to_qubit: dict[str, np.ndarray],
-        source_waveform,
+        n_samples: int,
+        fs: float,
         mode: str = "complex_baseband",
         source_impedance_ohm: float = 50.0,
     ) -> None:
         self._annotation = noise_annotation
         self._h_to_qubit = transfer_functions_to_qubit
-        self._sw = source_waveform
         self._mode = mode
         self._R = float(source_impedance_ohm)
 
-        self._N = source_waveform.n_samples
-        self._fs = source_waveform.fs
+        self._N = n_samples
+        self._fs = fs
 
         # Validate: every noise node must have a precomputed h_{j→qubit}
         missing = set(noise_annotation) - set(transfer_functions_to_qubit)

@@ -9,17 +9,21 @@ is needed as an additional parameter.
 In complex baseband mode the envelope is used directly as ũ(t).
 In real-axis mode it is modulated onto the carrier to produce the full RF waveform:
     v(t) = Re{ envelope(t) · exp(j·2π·f_carrier·t) }
+at the schematic's own native sample rate (see rf_waveform_at() and
+transfer_function.native_sample_rate() — PRD §3.3): real-axis mode resamples
+the envelope to match the schematic, rather than the transfer function being
+interpolated onto this waveform's own fs.
 
-# --- CURSOR NOTE ---
-# The SignalIntegrity Waveform type lives at:
+# SI API notes (verified against the installed SignalIntegrity source):
 #   SignalIntegrity.Lib.TimeDomain.Waveform.Waveform
-# Key attributes used here:
-#   .TimeDescriptor  ->  SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor
-#       .Fs          ->  sample rate (samples/sec)
-#       .K           ->  number of samples
-#       .H           ->  time of first sample (sec)
-#   .Values()        ->  list or np.ndarray of waveform samples
-# Verify these against the current SI repo before finalising.
+#   .TimeDescriptor()  ->  METHOD (not an attribute!), returns .td
+#                          -> SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor
+#       .Fs            ->  sample rate (samples/sec)
+#       .K             ->  number of samples
+#       .H             ->  time of first sample (sec)
+#   .Values()          ->  list of waveform samples (Waveform is itself a
+#                          list subclass; .td is the TimeDescriptor attribute
+#                          directly, equivalent to calling .TimeDescriptor()).
 # -------------------
 """
 
@@ -55,11 +59,7 @@ class SourceWaveform:
     _fs: float = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        # --- CURSOR NOTE ---
-        # Replace the attribute accesses below with the correct SI Waveform API.
-        # The pattern shown is based on SI repo inspection; confirm against source.
-        # -------------------
-        td = self.envelope.TimeDescriptor
+        td = self.envelope.td
         self._fs = float(td.Fs)           # sample rate, Hz
         n = int(td.K)                      # number of samples
         t0 = float(td.H)                   # time of first sample, seconds
@@ -106,11 +106,45 @@ class SourceWaveform:
     @property
     def rf_waveform(self) -> np.ndarray:
         """
-        Full real RF waveform v(t) = Re{ ũ(t) · exp(j·2π·fc·t) }, shape (N,).
-        Used in real-axis mode as the signal injected at the voltage source.
+        Full real RF waveform v(t) = Re{ ũ(t) · exp(j·2π·fc·t) }, shape (N,),
+        at this waveform's own sample rate (self.fs).
+
+        NOTE: real-axis mode does not use this directly — it uses
+        rf_waveform_at(fs) with the schematic's own native sample rate
+        (see transfer_function.native_sample_rate() / PRD §3.3). This
+        property remains useful standalone (e.g. for inspecting the pulse
+        at its native resolution) and is what real-axis mode falls back to
+        when the schematic's native rate happens to equal self.fs.
         """
         carrier = np.exp(1j * 2 * np.pi * self.carrier_freq_hz * self._t)
         return np.real(self._values * carrier)
+
+    def rf_waveform_at(self, fs: float) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Real RF waveform v(t), resampled to an explicit sample rate `fs`
+        rather than self.fs. Returns (t, v).
+
+        Real-axis mode uses this with the schematic's own native sample
+        rate: the schematic's transfer function is the source of truth for
+        real-axis time resolution (PRD §3.3), so the drive envelope is
+        resampled to match it, rather than the transfer function being
+        interpolated onto this waveform's own fs.
+
+        Resampling is FFT-based (scipy.signal.resample) on the complex
+        envelope, then modulated onto the carrier at the new rate — this is
+        more robust than resampling the already-modulated real RF signal,
+        since the baseband envelope is smooth/band-limited and safe to
+        resample directly.
+        """
+        if np.isclose(fs, self._fs):
+            return self._t, self.rf_waveform
+
+        from scipy.signal import resample
+        n_new = max(int(round(self.n_samples * fs / self._fs)), 1)
+        env_resampled = resample(self._values, n_new)
+        t_new = self._t[0] + np.arange(n_new) / fs
+        carrier = np.exp(1j * 2 * np.pi * self.carrier_freq_hz * t_new)
+        return t_new, np.real(env_resampled * carrier)
 
     @property
     def bandwidth_hz(self) -> float:
@@ -127,18 +161,26 @@ class SourceWaveform:
         """
         return self.bandwidth_hz / self.carrier_freq_hz
 
-    def check_sample_rate_for_real_axis(self, harmonic_order: int = 3) -> None:
+    def check_sample_rate_for_real_axis(self, fs: float, harmonic_order: int = 3) -> None:
         """
-        Raise ValueError if the sample rate is insufficient for real-axis mode.
+        Raise ValueError if `fs` is insufficient for real-axis mode.
         Nyquist requires fs > 2 · harmonic_order · carrier_freq.
+
+        `fs` is explicit rather than defaulting to self.fs because real-axis
+        mode runs at the schematic's own native sample rate (PRD §3.3), not
+        this waveform's original fs — pass
+        transfer_function.native_sample_rate(...) here.
         """
         required = 2.0 * harmonic_order * self.carrier_freq_hz
-        if self._fs < required:
+        if fs < required:
             raise ValueError(
-                f"Sample rate {self._fs/1e9:.2f} GSa/s is insufficient for real-axis "
+                f"Sample rate {fs/1e9:.2f} GSa/s is insufficient for real-axis "
                 f"mode with harmonic order {harmonic_order}. "
                 f"Need >= {required/1e9:.1f} GSa/s "
-                f"(2 × {harmonic_order} × {self.carrier_freq_ghz} GHz carrier)."
+                f"(2 × {harmonic_order} × {self.carrier_freq_ghz} GHz carrier). "
+                f"This is the schematic's own native sample rate (PRD §3.3) — "
+                f"increase its frequency sweep resolution (CalculationProperties "
+                f"EndFrequency / UserSampleRate) rather than this waveform's fs."
             )
 
 
