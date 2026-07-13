@@ -6,11 +6,18 @@
 ## What This Document Is
 
 This file is a companion to `SI_Quantum_Fidelity_Plugin_PRD.md`. It describes
-what has already been implemented, what Cursor needs to complete, and the exact
-API integration points with SignalIntegrity and QuTiP that require verification
-against the installed library versions.
+what has already been implemented, and documents the exact API integration
+points with SignalIntegrity and QuTiP as they were actually resolved (not
+just planned) against the installed library versions.
 
 Drop both this file and the PRD into your Cursor project context.
+
+**Status: all three Cursor tasks below are done.** The SI↔QuTiP bridge is
+fully wired up, tested, and has been used to run a series of physics
+investigations (nonlinearity, dispersion, impedance mismatch) documented in
+`INVESTIGATIONS.md` at the repo root — that file is the best evidence the
+integration actually works end-to-end, and is worth reading alongside this
+document for how the pieces below get used in practice.
 
 ---
 
@@ -47,11 +54,11 @@ si_qfi/
 │
 ├── schematic/
 │   ├── __init__.py                   ✅
-│   ├── loader.py                     ⚠️  CURSOR: SI schematic loading (stubs)
-│   └── transfer_function.py          ⚠️  CURSOR: SI S-parameter → transfer function (stubs)
+│   ├── loader.py                     ✅ SI schematic loading, incl. variables= override
+│   └── transfer_function.py          ✅ SI S-parameter → transfer function
 │
 ├── quantum/
-│   └── __init__.py                   ⚠️  CURSOR: verify QuTiP v5 API call signatures
+│   └── __init__.py                   ✅ gate_fidelity(), Transmon/QubitModel, T1/T2 Lindblad
 │
 ├── output/
 │   └── __init__.py                   🔲 Phase 3 stub
@@ -59,34 +66,39 @@ si_qfi/
 ├── sweep/
 │   └── __init__.py                   🔲 Phase 3 stub
 │
-└── tests/
-    └── test_nonlinear.py             ✅ 17 unit tests, all passing, no SI/QuTiP required
+├── examples/                         ✅ Runnable investigation demos (one per INVESTIGATIONS.md section)
+├── INVESTIGATIONS.md                 ✅ Running report log of physics findings
+│
+└── tests/                            ✅ Full suite: nonlinear/noise/engine/schematic/quantum
 ```
 
-Legend: ✅ complete and tested  ⚠️ needs Cursor  🔲 future phase stub
+Legend: ✅ complete and tested  🔲 future phase stub
 
 ---
 
-## Running Tests Without SI or QuTiP
-
-The nonlinear math, noise generation, and PSD tests all run with only numpy/scipy:
+## Running Tests
 
 ```bash
-pip install numpy scipy
+pip install pytest
 cd si_qfi
-python -c "
-import sys; sys.path.insert(0, '.')
-# paste contents of tests/test_nonlinear.py here, or run via pytest
-"
+pytest tests/ -v
 ```
 
-All 17 tests currently pass. These cover:
+`tests/test_nonlinear.py`, `test_noise.py`, `test_engine.py` etc. run with
+only numpy/scipy. `test_schematic_hookup.py`, `test_quantum*.py` need
+SignalIntegrity and/or QuTiP installed — they `pytest.importorskip()`
+themselves and are skipped automatically otherwise, rather than failing.
+Full suite is 130+ tests, all passing with SI + QuTiP installed. Coverage
+includes:
 - Saleh gain compression, zero-input safety, P1dB -1dB result
 - The 3/4 describing function coefficient (PRD §5.1 core math)
 - SalehRealAxisModel linear regime, compression, and 3rd-harmonic generation
 - Volterra linear regime and compression
 - Noise PSD from noise figure spec
 - Baseband and RF noise realization statistics
+- Real SI schematic loading/extraction (`test_schematic_hookup.py`), incl.
+  the `variables=` override mechanism (`test_quantum_impedance_mismatch.py`)
+- Real QuTiP gate/state fidelity end-to-end (`test_quantum*.py`)
 
 ---
 
@@ -207,61 +219,52 @@ waveform's fs — the waveform is resampled to match instead
 
 ---
 
-## Cursor Task 3: quantum/__init__.py — QuTiP v5 API Verification
+## Cursor Task 3: quantum/__init__.py — QuTiP v5 API — DONE
 
 **File:** `si_qfi/quantum/__init__.py`
-**Status:** Logic complete. Three QuTiP API call sites need verification.
+**Status:** Fully implemented, verified against QuTiP 5.0.4 (installed via
+PyPI — the local git clone needs Python 3.11, which wasn't available), and
+exercised end-to-end by a 2-level Rabi oscillation demo
+(`examples/rabi_oscillation_demo.py`) plus every investigation demo in
+`INVESTIGATIONS.md`.
 
-### Call site 1: propagator
-
-Current code:
+`gate_fidelity()` takes the whole `SimulationResult` object directly, not
+separate `v_qubit_ensemble`/`t_array` arguments:
 ```python
-U_actual = qt.propagator(H, T_gate, c_ops=c_ops, tlist=t_array)
+def gate_fidelity(
+    result: "SimulationResult",
+    qubit: "Transmon | QubitModel",
+    coupling_strength_per_volt: float,
+    ideal_gate: Optional[Union[str, Any]] = None,
+    target_state: Optional[Any] = None,
+    initial_state: Optional[Any] = None,
+    T1_us: Optional[float] = None,
+    T2_us: Optional[float] = None,
+    lpf_cutoff_hz: Optional[float] = None,
+) -> FidelityResult:
 ```
+At least one of `ideal_gate` (a string name or a custom `qt.Qobj`/ndarray
+unitary) or `target_state` must be given. `FidelityResult` also carries
+`.propagators` (list of `Qobj`, unitary or superoperator) and a
+`.final_states(initial_state=None)` method, populated at no extra cost.
 
-In QuTiP v5 the signature is:
-```python
-qt.propagator(H, t, c_ops=[], args={}, options={}, **kwargs)
-```
-where `H` is a list `[H0, [op, coeff_array]]` and the solver needs to know the
-time grid for array coefficients. Verify whether `tlist` is passed as a keyword
-argument to `propagator` or whether the array coefficient is wrapped in `QobjEvo`
-first.
+**A real bug found here, not just an API-naming question:** QuTiP's adaptive
+ODE solver (`sesolve`/`propagator`) will silently skip over an entire pulse
+if `max_step` isn't capped to the coefficient array's own sample spacing —
+this gave `F ≈ 1/3` (indistinguishable from an untouched/identity
+evolution) with no error or warning. Fixed by explicitly setting
+`options={"max_step": dt, "nsteps": ...}` sized to the drive waveform's
+actual time grid. If you ever see suspiciously-low fidelity that doesn't
+respond to physically-reasonable parameter changes, check this first.
 
-The safest v5 pattern may be:
-```python
-H_evo = qt.QobjEvo([H0, [op_i, coeff_i], [op_q, coeff_q]], tlist=t_array)
-U_actual = qt.propagator(H_evo, T_gate, c_ops=c_ops)
-```
-
-### Call site 2: average_gate_fidelity
-
-Current code:
-```python
-F_i = qt.average_gate_fidelity(U_actual, U_ideal)
-```
-
-In QuTiP v5 this function exists but argument order may matter. Verify:
-- Function name: `qt.average_gate_fidelity` or `qt.metrics.average_gate_fidelity`
-- Argument order: (actual, target) or (target, actual)
-- Whether it accepts superoperators (open system) or unitaries only
-
-For open-system propagators (mesolve), `U_actual` is a superoperator (Liouville
-space). The fidelity calculation differs. Check `qt.process_fidelity` as an
-alternative for superoperator inputs.
-
-### Call site 3: QobjEvo array coefficients
-
-The Hamiltonian list format with numpy array coefficients:
-```python
-H = [H0, [op_i, coeff_i_array], [op_q, coeff_q_array]]
-result = qt.sesolve(H, psi0, t_array)
-```
-
-In v5, the solver uses `tlist` (the time array passed to sesolve) to index into
-the coefficient arrays. Confirm that when `tlist` is the same array as was used
-to compute the waveform, the cubic spline interpolation is applied automatically
-and no explicit `QobjEvo` wrapper is needed.
+Resolved specifics, for reference:
+- `qt.propagator(H_evo, T_gate, c_ops=c_ops, options={...})` with
+  `H_evo = qt.QobjEvo([H0, [op_i, coeff_i], [op_q, coeff_q]], tlist=t_array)`.
+- `qt.average_gate_fidelity(U_actual, U_ideal)` — this is the correct name
+  and argument order in 5.0.4.
+- Array-coefficient `QobjEvo` cubic-spline interpolation onto `tlist` works
+  as expected once `max_step`/`nsteps` are capped as above; no additional
+  wrapping needed beyond that.
 
 ---
 
@@ -460,18 +463,25 @@ pip install scqubits
 
 ## Phase Roadmap
 
-**Phase 1 (current — complete the Cursor tasks above):**
+**Phase 1 — DONE:**
 - Wire up SI schematic loading and transfer function extraction
-- Verify QuTiP v5 API calls
+- Verify QuTiP v5 API calls (and fix the `max_step`/`nsteps` bug found along the way)
 - Run end-to-end with a simple single-qubit schematic
 
-**Phase 2:**
-- Multi-segment propagation tests with real schematics
-- scqubits Transmon/Fluxonium integration
-- Lindblad T1/T2 secondary noise mode
-- Rotating frame demodulation for real-axis mode
+**Phase 2 — mostly done:**
+- Multi-segment propagation tests with real schematics — done, see
+  `INVESTIGATIONS.md` Investigations 3-5 (two cascaded amplifiers, multi-segment
+  lossy lines, schematic-level parametrized impedance/delay)
+- Lindblad T1/T2 secondary noise mode — done (`gate_fidelity(T1_us=, T2_us=)`)
+- Real-axis mode (harmonic content, no baseband demodulation assumption) — done,
+  used throughout the investigations
+- scqubits Transmon/Fluxonium integration — `from_scqubits()` exists in
+  `quantum/__init__.py` but is still marked "verify against installed
+  version" in its own comments; not yet exercised against a real scqubits
+  install. Everything else in this codebase uses the analytic `Transmon`/
+  `QubitModel` classes instead, which are fully verified.
 
-**Phase 3:**
+**Phase 3 (not started):**
 - Multi-probe schematics (crosstalk analysis)
 - Parameter sweep utilities (`sweep/parameter_sweep.py`)
 - Fidelity budget decomposition (`sweep/budget.py`)
@@ -480,38 +490,19 @@ pip install scqubits
 
 ---
 
-## Suggested First Integration Test
+## First Integration Test — superseded
 
-Once Cursor completes the SI API integration, use this minimal schematic to
-validate end-to-end:
-
-1. Create a SignalIntegrity schematic with:
-   - `VoltageSource` → 50Ω coax 10cm → `VoltageProbe` labelled `QUBIT_PROBE`
-   - No NL nodes, no noise (simplest case)
-
-2. Run:
-```python
-import si_qfi as siq
-import numpy as np
-
-schematic = siq.load_schematic("test_coax.si")
-# Build a simple Gaussian envelope SI Waveform (fill in SI Waveform API)
-source = siq.SourceWaveform(carrier_freq_ghz=5.0, envelope=gaussian_si_waveform)
-
-result = siq.run(schematic=schematic, source=source, n_realizations=1)
-
-# Check: v_nl_qubit should be the Gaussian pulse attenuated and delayed by 10cm coax
-print(result.v_nl_qubit[:10])
-print("Warnings:", result.warnings)
-```
-
-3. Then add a Saleh NL node and verify the compression appears in the waveform.
-
-4. Then add a noise node and verify ensemble spread in `result.v_qubit_ensemble`.
-
-5. Finally wire up QuTiP fidelity for the X gate.
+This section originally sketched a minimal end-to-end validation test to run
+once Cursor completed the SI API integration. That integration is done, and
+the actual end-to-end validation is now `examples/rabi_oscillation_demo.py`
+(the simplest case: single amplifier, no NL, no noise, 2-level Rabi
+oscillation) plus every demo in `examples/` referenced from
+`INVESTIGATIONS.md` — those are real, runnable, currently-passing
+end-to-end tests against real schematics, and are more useful than the
+sketch that used to live here. Start there instead.
 
 ---
 
-*Handoff document generated June 2026.*
-*Companion files: SI_Quantum_Fidelity_Plugin_PRD.md, si_qfi_package.tar.gz*
+*Handoff document generated June 2026; updated 2026-07-11 to reflect the*
+*completed SI/QuTiP integration and the INVESTIGATIONS.md report series.*
+*Companion files: SI_Quantum_Fidelity_Plugin_PRD.md, INVESTIGATIONS.md*

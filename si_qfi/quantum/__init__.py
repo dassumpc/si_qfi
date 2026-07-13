@@ -11,48 +11,55 @@ Responsibilities
 4. Compute average gate fidelity from the propagator.
 5. Demodulate real RF waveform to I/Q for the rotating frame (real-axis mode).
 
-# --- CURSOR NOTE ---
-# This module uses QuTiP v5. Key API points to verify against installed version:
-#
-#   import qutip as qt
-#
-#   Operators:
-#     qt.destroy(n)        — lowering operator, Fock space dim n
-#     qt.create(n)         — raising operator
-#     qt.num(n)            — number operator
-#     qt.qeye(n)           — identity
-#     qt.sigmaz()          — Pauli Z (two-level only)
-#
-#   Time-dependent Hamiltonian (QobjEvo with array coefficients):
-#     H = [H0, [op, coeff_array]]   with tlist=t_array passed to solver
-#     OR: H = qt.QobjEvo([H0, [op, coeff_array]], tlist=t_array)
-#     The solver uses cubic spline interpolation on coeff_array by default.
-#
-#   Solvers:
-#     qt.sesolve(H, psi0, tlist, ...)       — closed system (Schrödinger)
-#     qt.mesolve(H, rho0, tlist, c_ops, ...)— open system (Lindblad master eq)
-#
-#   Propagator:
-#     qt.propagator(H, T, c_ops=[], tlist=tlist)
-#     Returns Qobj (unitary for closed, superoperator for open).
-#
-#   Fidelity:
-#     qt.average_gate_fidelity(U_actual, U_ideal)
-#     NOTE: in QuTiP v5 this may be qt.average_gate_fidelity or
-#     qt.process_fidelity — check current docs and confirm function name.
-#
-#   scqubits (optional):
-#     import scqubits as scq
-#     transmon = scq.Transmon(EJ=20.0, EC=0.2, ng=0.0, ncut=30)
-#     H0 = transmon.hamiltonian()   # returns QuTiP Qobj
-# -------------------
+QuTiP API (verified against QuTiP 5.0.4, 2026-07-11 -- installed from PyPI,
+not the bleeding-edge git clone, which currently requires Python >=3.11 and
+so can't be used on this project's Python 3.9 environment):
+
+  import qutip as qt
+
+  Operators:
+    qt.destroy(n)        — lowering operator, Fock space dim n
+    qt.num(n)             — number operator
+    qt.qeye(n)            — identity
+    qt.sigmaz()           — Pauli Z (two-level only -- see gate_fidelity()'s
+                             T2_us docstring for why this doesn't generalize
+                             to n_levels > 2 as-is)
+
+  Time-dependent Hamiltonian (list format):
+    H = [H0, [op_i, coeff_i_array], [op_q, coeff_q_array]]
+    Passed directly to qt.propagator(..., tlist=t_array) -- propagator's
+    **kwargs (including tlist) are forwarded to the QobjEvo built from this
+    list internally; no need to construct QobjEvo explicitly. QuTiP applies
+    cubic spline interpolation to the array coefficients by default.
+
+  Propagator (the sole solver entry point used here -- see gate_fidelity()):
+    qt.propagator(H, T, c_ops=(), tlist=t_array)
+    Confirmed: returns a plain unitary Qobj when c_ops=() (dispatches to
+    sesolve internally), or a superoperator (type='super', supermatrix form)
+    when c_ops is non-empty (dispatches to mesolve internally).
+
+  Fidelity:
+    qt.average_gate_fidelity(oper, target=None)
+    Confirmed: oper may be EITHER a unitary or a superoperator (as returned
+    by propagator() above, either case); target must be a plain unitary.
+    Global phase does not affect the result (confirmed via a resonant
+    pi-pulse test: U_actual came back as -i*sigmax-like, still gave F≈1
+    against the plain [[0,1],[1,0]] X matrix).
+
+  scqubits (optional):
+    import scqubits as scq
+    transmon = scq.Transmon(EJ=20.0, EC=0.2, ng=0.0, ncut=30)
+    H0 = transmon.hamiltonian()   # returns QuTiP Qobj
 """
 
 from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional, Any
+from typing import Optional, Any, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..simulation.engine import SimulationResult
 
 
 # ---------------------------------------------------------------------------
@@ -240,13 +247,17 @@ def build_hamiltonian(
     envelope_q: np.ndarray,
     t_array: np.ndarray,
     coupling_strength_per_volt: float,
-    rotating_frame: bool = True,
 ):
     """
     Build a QuTiP time-dependent Hamiltonian from I/Q waveform arrays.
 
     H(t) = H₀  +  η·I(t)·(a+a†)/2  +  η·Q(t)·i(a-a†)/2
-    in the rotating frame (RWA applied externally by the user in H₀).
+    in the rotating frame -- H₀ must already be expressed in that frame
+    (e.g. 0 for an exactly-resonant drive, or a small detuning term; RWA
+    applied externally by the caller when constructing qubit_model.H0).
+    There is currently no lab-frame path -- both complex_baseband and
+    real_axis modes funnel into this same rotating-frame Hamiltonian
+    (real_axis mode demodulates to I/Q first, see gate_fidelity()).
 
     The I/Q arrays are passed as numpy array coefficients to QobjEvo.
     QuTiP v5 applies cubic spline interpolation automatically.
@@ -261,31 +272,15 @@ def build_hamiltonian(
         Time array corresponding to envelope samples (seconds).
     coupling_strength_per_volt : float
         η = drive coupling in rad/(s·V). Converts voltage to Hamiltonian coefficient.
-    rotating_frame : bool
-        If True, H₀ is assumed to be in the rotating frame (subtract ω_q·n from H₀
-        externally). If False, the full lab-frame H₀ is used with the carrier-frequency
-        drive (not recommended; very stiff ODE).
 
     Returns
     -------
     H : list   [H0, [op_I, coeff_I], [op_Q, coeff_Q]]
-        QuTiP time-dependent Hamiltonian in list format, ready for sesolve/mesolve.
-        The tlist= argument must be passed as t_array when calling the solver.
-
-    # --- CURSOR NOTE ---
-    # In QuTiP v5, the preferred way is:
-    #
-    #   H = [H0, [drive_op_i, coeff_i_array], [drive_op_q, coeff_q_array]]
-    #   result = qt.sesolve(H, psi0, t_array, ...)
-    #
-    # The solver infers tlist from the positional tlist argument and uses
-    # cubic spline to interpolate the coeff arrays.
-    #
-    # If QobjEvo is needed explicitly:
-    #   H_t = qt.QobjEvo([H0, [drive_op_i, coeff_i_array]], tlist=t_array)
-    #
-    # Confirm the exact calling convention for the installed QuTiP v5 version.
-    # -------------------
+        QuTiP time-dependent Hamiltonian in list format, ready for
+        qt.propagator(H, T, c_ops=..., tlist=t_array) (or sesolve/mesolve
+        directly). Verified against QuTiP 5.0.4: propagator's **kwargs are
+        forwarded to the QobjEvo built from this list format, so tlist=
+        controls the cubic-spline grid for envelope_i/envelope_q.
     """
     try:
         import qutip as qt
@@ -318,17 +313,55 @@ def build_hamiltonian(
 class FidelityResult:
     """
     Fidelity computation result over an ensemble of noise realizations.
+
+    propagators holds the raw per-realization channel (a QuTiP Qobj -- a
+    plain unitary for a closed-system run, or a superoperator if T1_us/
+    T2_us were given) that gate_fidelity() already had to compute to get
+    F_avg -- kept here at zero extra cost so callers can inspect/reuse it
+    (e.g. via final_states()) without re-solving anything.
     """
-    fidelities: np.ndarray         # shape (n_realizations,)
-    F_avg: float
-    F_std: float
-    F_sem: float
-    ideal_gate: str
     n_realizations: int
+    propagators: list = field(default_factory=list)   # per-realization qt.Qobj (unitary or superoperator) -- always populated
+    fidelities: Optional[np.ndarray] = None            # shape (n_realizations,) -- average GATE fidelity; only set if ideal_gate was given
+    F_avg: Optional[float] = None
+    F_std: Optional[float] = None
+    F_sem: Optional[float] = None
+    ideal_gate: Optional[str] = None                   # gate name (or repr of a custom Qobj target), None if only target_state was requested
+    state_fidelities: Optional[np.ndarray] = None       # shape (n_realizations,) -- only set if target_state was given
+    state_F_avg: Optional[float] = None
+    state_F_std: Optional[float] = None
+    state_F_sem: Optional[float] = None
     warnings: list[str] = field(default_factory=list)
 
+    def final_states(self, initial_state=None) -> list:
+        """
+        Apply each stored propagator/channel to `initial_state` (a QuTiP
+        ket or density matrix; defaults to the ground state |0><0|),
+        returning one density matrix per realization -- the "raw density
+        matrix" a caller wants, computed from the already-solved
+        propagators without any new QuTiP solve.
+        """
+        if not self.propagators:
+            raise ValueError(
+                "No propagators stored on this FidelityResult -- "
+                "gate_fidelity() should always populate this; if it's "
+                "empty something upstream went wrong."
+            )
+        import qutip as qt
+        if initial_state is None:
+            n = self.propagators[0].dims[0][0]
+            initial_state = qt.basis(n, 0)
+        return [apply_channel(U, initial_state) for U in self.propagators]
+
     def plot_fidelity_hist(self, bins: int = 20) -> None:
-        """Plot histogram of per-realization fidelities."""
+        """Plot histogram of per-realization GATE fidelities. Raises if
+        gate_fidelity() was called without ideal_gate (nothing to plot)."""
+        if self.fidelities is None:
+            raise ValueError(
+                "No gate fidelities on this result -- gate_fidelity() was "
+                "called with target_state only (no ideal_gate). Use "
+                ".state_fidelities directly instead."
+            )
         try:
             import matplotlib.pyplot as plt
         except ImportError:
@@ -345,11 +378,39 @@ class FidelityResult:
         plt.show()
 
     def __repr__(self) -> str:
-        return (
-            f"FidelityResult(gate='{self.ideal_gate}', "
-            f"F_avg={self.F_avg:.5f}, F_std={self.F_std:.5f}, "
-            f"F_sem={self.F_sem:.6f}, N={self.n_realizations})"
+        gate_part = (
+            f"gate='{self.ideal_gate}', F_avg={self.F_avg:.5f}, "
+            f"F_std={self.F_std:.5f}, F_sem={self.F_sem:.6f}"
+            if self.F_avg is not None else "gate=None"
         )
+        state_part = (
+            f", state_F_avg={self.state_F_avg:.5f}" if self.state_F_avg is not None else ""
+        )
+        return f"FidelityResult({gate_part}{state_part}, N={self.n_realizations})"
+
+
+def apply_channel(U, state):
+    """
+    Apply a QuTiP propagator/channel `U` (as stored in
+    FidelityResult.propagators -- a plain unitary Qobj for a closed-system
+    run, or a superoperator for an open-system/T1,T2 run) to `state` (a ket
+    or density matrix), returning the resulting density matrix.
+
+    QuTiP's own calling convention differs between the two cases (confirmed
+    directly against QuTiP 5.0.4): a superoperator can be applied directly
+    to a density matrix via U(rho), but a plain unitary can only be called
+    directly on a ket (U(psi)) -- calling a unitary on a density matrix
+    raises TypeError("oper cannot act on oper"); the correct unitary case
+    is U*rho*U.dag(). This dispatches on U.type so callers don't need to
+    know which case applies.
+    """
+    import qutip as qt
+    if U.type == "super":
+        rho = qt.ket2dm(state) if state.type == "ket" else state
+        return U(rho)
+    # U.type == "oper" (plain unitary)
+    psi_or_rho = U(state) if state.type == "ket" else U * state * U.dag()
+    return qt.ket2dm(psi_or_rho) if psi_or_rho.type == "ket" else psi_or_rho
 
 
 # ---------------------------------------------------------------------------
@@ -402,50 +463,135 @@ def ideal_gate_unitary(gate_name: str, n_levels: int):
 # ---------------------------------------------------------------------------
 
 def gate_fidelity(
-    v_qubit_ensemble: list[np.ndarray],
-    t_array: np.ndarray,
+    result: "SimulationResult",
     qubit: "Transmon | QubitModel",
-    ideal_gate: str,
     coupling_strength_per_volt: float,
-    rotating_frame: bool = True,
+    ideal_gate: Optional[Union[str, Any]] = None,
+    target_state: Optional[Any] = None,
+    initial_state: Optional[Any] = None,
     T1_us: Optional[float] = None,
     T2_us: Optional[float] = None,
     lpf_cutoff_hz: Optional[float] = None,
-    mode: str = "complex_baseband",
 ) -> FidelityResult:
     """
-    Compute average gate fidelity over an ensemble of noisy qubit waveforms.
+    Compute average gate fidelity (and/or state fidelity to a target state)
+    over an ensemble of noisy qubit waveforms.
+
+    Verified against QuTiP 5.0.4 (2026-07-11): qt.propagator(H, T, c_ops=,
+    tlist=) and qt.average_gate_fidelity(oper, target) both confirmed to
+    behave exactly as this function assumes -- propagator returns a plain
+    unitary Qobj when c_ops=[] (dispatches to sesolve internally) and a
+    superoperator when c_ops is non-empty (dispatches to mesolve);
+    average_gate_fidelity accepts either against a plain unitary target.
+    See tests/test_quantum.py for the calibrated-pulse checks this was
+    confirmed against.
 
     Parameters
     ----------
-    v_qubit_ensemble : list of np.ndarray
-        One waveform array per realization. Complex (baseband mode) or real (real-axis).
-    t_array : np.ndarray, float64, shape (N,)
-        Shared time axis for all realizations.
+    result : simulation.engine.SimulationResult
+        Output of siq.run() -- supplies v_qubit_ensemble, fs, mode, and
+        carrier_freq_hz all at once (the single source of truth for what
+        was actually simulated), rather than the caller reassembling a
+        time axis / mode / carrier by hand.
     qubit : Transmon or QubitModel
         Qubit Hamiltonian definition.
-    ideal_gate : str
-        Gate name string, e.g. 'X', 'Y', 'X/2'.
     coupling_strength_per_volt : float
         η: drive coupling constant in rad/(s·V).
-    rotating_frame : bool
-        If True, I/Q components drive the rotating-frame Hamiltonian.
+    ideal_gate : str or qt.Qobj, optional
+        Gate name string (e.g. 'X', 'Y', 'X/2' -- see ideal_gate_unitary())
+        OR a custom target unitary supplied directly as a QuTiP Qobj (or a
+        plain ndarray, auto-wrapped) -- e.g. a gate not in the named table,
+        or one you've derived elsewhere. If given, the returned
+        fidelities/F_avg/F_std/F_sem are the average GATE fidelity to this
+        target (qt.average_gate_fidelity -- compares the whole channel,
+        independent of any particular input state).
+
+        CAUTION for qubit.n_levels > 2 with a non-trivial H0 (e.g. a real
+        Transmon): ideal_gate_unitary() embeds the named gate on {0,1} and
+        plain IDENTITY on higher levels. average_gate_fidelity then
+        penalizes any relative phase U_actual picks up on those higher
+        levels from ordinary free evolution under H0 for the gate duration
+        -- physically unobservable for a qubit that starts and ends in the
+        {0,1} subspace, but NOT phase-invariant away from it the way a pure
+        global phase would be (confirmed directly: a propagator that was
+        essentially exact -i*X on {0,1} with ~0 leaked population still
+        scored average_gate_fidelity ~0.3-0.7, purely from an unpopulated-
+        |2>-level phase mismatch against the identity-embedded target). For
+        n_levels > 2, prefer `target_state` (state fidelity from a chosen
+        initial_state, e.g. |0> -> target |1>) to measure real leakage --
+        it's insensitive to this artifact. See
+        examples/transmon_leakage_demo.py's module docstring ("trap #2")
+        for the full diagnosis.
+    target_state : qt.Qobj, optional
+        A target ket or density matrix to compare the ACTUAL evolved state
+        against (qt.fidelity -- a state, not a channel, comparison). If
+        given, `initial_state` is evolved through the simulated waveform
+        and the resulting density matrix's fidelity to `target_state` is
+        computed per realization and returned as state_fidelities/
+        state_F_avg/state_F_std/state_F_sem. At least one of ideal_gate /
+        target_state must be given (raises otherwise) -- both may be given
+        together to get both metrics from the same solve.
+    initial_state : qt.Qobj, optional
+        Ket or density matrix to evolve for the target_state comparison.
+        Defaults to the ground state |0> (qt.basis(qubit.n_levels, 0)).
+        Ignored if target_state is not given.
     T1_us, T2_us : float, optional
-        Intrinsic qubit T1 and T2 (microseconds). If supplied, mesolve is used
-        with Lindblad collapse operators; otherwise sesolve (closed system).
+        Intrinsic qubit T1 and T2 (microseconds). If supplied, propagator
+        is computed with Lindblad collapse operators (dispatches to
+        mesolve internally); otherwise closed-system (sesolve). T2's
+        pure-dephasing collapse operator uses qt.sigmaz(), which is only
+        meaningful for a 2-level qubit -- passing T2_us with
+        qubit.n_levels != 2 will raise a dimension-mismatch error from
+        QuTiP itself when the operator is applied.
+
+        CAUTION: T_gate (the duration decoherence acts over) is derived
+        from `len(result.v_qubit_ensemble[0]) / result.fs` -- the FULL
+        simulated array length, not "the pulse duration" as the caller
+        conceived it. Convolving a drive envelope through a schematic can
+        pad the array with extra samples (e.g. from the schematic's own
+        impulse response / group delay) well beyond the nominal pulse
+        length -- confirmed directly on tests/test_schematic_basic.si,
+        which adds a ~99ns tail essentially independent of input pulse
+        length. That padding is harmless for closed-system fidelity (no
+        drive there, so the propagator segment over it is ~identity), but
+        NOT for T1_us/T2_us -- decoherence keeps acting through it, so
+        reported infidelity is inflated by an amount that has nothing to
+        do with the nominal gate and everything to do with this
+        schematic's convolution padding. If comparing decoherence-driven
+        infidelity across different pulse durations or schematics, always
+        measure and normalize against the TRUE simulated T_gate (as above),
+        not the value passed to your envelope generator. See
+        examples/t1_t2_decoherence_demo.py's module docstring for the full
+        diagnosis and a worked example.
     lpf_cutoff_hz : float, optional
-        Low-pass filter cutoff for demodulation in real-axis mode.
-    mode : str
-        'complex_baseband' or 'real_axis'.
+        Low-pass filter cutoff for demodulation in real_axis mode (removes
+        the 2·f_carrier image after mixing down to baseband -- see
+        demodulate()). Ignored in complex_baseband mode.
 
     Returns
     -------
     FidelityResult
+        Always has .propagators populated (one qt.Qobj per realization --
+        the raw channel, unitary or superoperator -- at zero extra solve
+        cost); call .final_states() on the result to get actual density
+        matrices from it for any initial state, including after the fact.
     """
     try:
         import qutip as qt
     except ImportError:
         raise ImportError("QuTiP is required. pip install qutip")
+
+    if ideal_gate is None and target_state is None:
+        raise ValueError(
+            "gate_fidelity() needs at least one of ideal_gate (a gate name "
+            "or custom target unitary) or target_state (a target ket/"
+            "density matrix) to compare against -- neither was given."
+        )
+
+    v_qubit_ensemble = result.v_qubit_ensemble
+    fs = result.fs
+    mode = result.mode
+    carrier_hz = result.carrier_freq_hz
 
     # Resolve qubit model
     if isinstance(qubit, Transmon):
@@ -454,7 +600,18 @@ def gate_fidelity(
         qmodel = qubit
 
     n = qmodel.n_levels
-    U_ideal = ideal_gate_unitary(ideal_gate, n)
+
+    U_ideal = None
+    if ideal_gate is not None:
+        if isinstance(ideal_gate, str):
+            U_ideal = ideal_gate_unitary(ideal_gate, n)
+        else:
+            # Custom target unitary supplied directly -- a qt.Qobj already,
+            # or a plain ndarray (auto-wrapped).
+            U_ideal = ideal_gate if isinstance(ideal_gate, qt.Qobj) else qt.Qobj(ideal_gate)
+
+    if target_state is not None and initial_state is None:
+        initial_state = qt.basis(n, 0)
 
     # Collapse operators for open-system simulation
     c_ops = []
@@ -471,58 +628,84 @@ def gate_fidelity(
         if gamma_phi > 0:
             c_ops.append(np.sqrt(gamma_phi) * qt.sigmaz())
 
-    carrier_hz = None
-    if mode == "real_axis":
-        # We need carrier freq for demodulation; retrieve from first waveform's metadata
-        # --- CURSOR NOTE ---
-        # The engine should pass carrier_freq_hz explicitly; for now we raise.
-        raise NotImplementedError(
-            "Real-axis mode: pass v_qubit_ensemble as complex (pre-demodulated) arrays, "
-            "or call demodulate() before gate_fidelity(). "
-            "Direct real-RF → gate_fidelity path not yet implemented."
-        )
+    # Shared time axis for every realization -- SimulationResult deliberately
+    # doesn't store one (engine.py's arrays grow segment-to-segment and only
+    # `fs` is assumed meaningful across the whole result), so it's derived
+    # here from fs + the (shared, engine-guaranteed) ensemble length.
+    n_samples = len(v_qubit_ensemble[0])
+    t_array = np.arange(n_samples) / fs
+    T_gate = t_array[-1]
+    dt = 1.0 / fs
 
-    fidelities = []
+    # CRITICAL: cap the ODE integrator's step to the coefficient array's own
+    # sample spacing. Confirmed by direct testing (2026-07-11) that QuTiP's
+    # default adaptive step-size control can silently step clean OVER an
+    # entire drive pulse when H0 gives it no intrinsic timescale (e.g. an
+    # exactly-resonant qubit, H0=0) -- against a real (numerically-noisy,
+    # FFT/convolution-derived) envelope array this produced U_actual ~
+    # identity (near-total-nonsense: F~1/3 to a target X gate) with NO error
+    # or warning from QuTiP. A clean synthetic analytic array did NOT
+    # reproduce this, so it can't be assumed away -- every simulated
+    # waveform this module receives has some numerical noise. Without this,
+    # gate_fidelity() would silently return wrong numbers for any
+    # non-constant envelope (i.e. essentially all real pulses).
+    # nsteps must be raised alongside max_step -- capping the step size to
+    # dt means the integrator may need on the order of n_samples internal
+    # steps (e.g. ~4000 for a 100ns pulse at real_axis mode's 40 GSa/s
+    # native rate), which exceeds QuTiP's default nsteps ceiling and raises
+    # IntegratorException("Excess work done on this call...") otherwise.
+    solver_options = {"max_step": dt, "nsteps": max(10_000, 20 * n_samples)}
+
+    propagators = []
+    fidelities = [] if U_ideal is not None else None
+    state_fidelities = [] if target_state is not None else None
     n_real = len(v_qubit_ensemble)
 
     for v in v_qubit_ensemble:
         v = np.asarray(v)
 
-        # Extract I/Q
+        # Extract I/Q. np.real()/np.imag() return non-contiguous views into
+        # the underlying complex128 buffer -- copy to plain contiguous
+        # float64 arrays before handing them to QuTiP.
         if mode == "complex_baseband":
-            env_i = np.real(v)
-            env_q = np.imag(v)
-        else:
+            env_i = np.ascontiguousarray(np.real(v))
+            env_q = np.ascontiguousarray(np.imag(v))
+        elif mode == "real_axis":
             env_i, env_q = demodulate(v, t_array, carrier_hz, lpf_cutoff_hz)
+            env_i = np.ascontiguousarray(env_i)
+            env_q = np.ascontiguousarray(env_q)
+        else:
+            raise ValueError(f"Unknown mode '{mode}' on result.")
 
         H = build_hamiltonian(qmodel, env_i, env_q, t_array, coupling_strength_per_volt)
-        T_gate = t_array[-1]
 
-        # --- CURSOR NOTE ---
-        # qt.propagator signature in v5:
-        #   qt.propagator(H, T, c_ops=[], tlist=tlist, options=...)
-        # The tlist here tells the solver about the array coefficient grid.
-        # Confirm this is the correct call signature for QuTiP 5.x.
-        # -------------------
-        U_actual = qt.propagator(H, T_gate, c_ops=c_ops, tlist=t_array)
+        U_actual = qt.propagator(H, T_gate, c_ops=c_ops, tlist=t_array, options=solver_options)
+        propagators.append(U_actual)
 
-        # --- CURSOR NOTE ---
-        # In QuTiP v5 the fidelity function name may differ:
-        #   qt.average_gate_fidelity(oper, target)
-        # or
-        #   qt.process_fidelity(oper, target)
-        # Check which is present in the installed version and what the
-        # argument order is (actual, ideal) vs (ideal, actual).
-        # -------------------
-        F_i = qt.average_gate_fidelity(U_actual, U_ideal)
-        fidelities.append(float(F_i))
+        if U_ideal is not None:
+            fidelities.append(float(qt.average_gate_fidelity(U_actual, U_ideal)))
+        if target_state is not None:
+            rho_final = apply_channel(U_actual, initial_state)
+            state_fidelities.append(float(qt.fidelity(rho_final, target_state)))
 
-    fidelities = np.array(fidelities)
-    return FidelityResult(
-        fidelities=fidelities,
-        F_avg=float(np.mean(fidelities)),
-        F_std=float(np.std(fidelities)),
-        F_sem=float(np.std(fidelities) / np.sqrt(n_real)),
-        ideal_gate=ideal_gate,
-        n_realizations=n_real,
-    )
+    result_kwargs = dict(n_realizations=n_real, propagators=propagators)
+
+    if fidelities is not None:
+        fidelities = np.array(fidelities)
+        result_kwargs.update(
+            fidelities=fidelities,
+            F_avg=float(np.mean(fidelities)),
+            F_std=float(np.std(fidelities)),
+            F_sem=float(np.std(fidelities) / np.sqrt(n_real)),
+            ideal_gate=ideal_gate if isinstance(ideal_gate, str) else repr(ideal_gate),
+        )
+    if state_fidelities is not None:
+        state_fidelities = np.array(state_fidelities)
+        result_kwargs.update(
+            state_fidelities=state_fidelities,
+            state_F_avg=float(np.mean(state_fidelities)),
+            state_F_std=float(np.std(state_fidelities)),
+            state_F_sem=float(np.std(state_fidelities) / np.sqrt(n_real)),
+        )
+
+    return FidelityResult(**result_kwargs)

@@ -106,6 +106,7 @@ def load_schematic(
     path: str | Path,
     qubit_probe_label: str = _DEFAULT_QUBIT_PROBE_LABEL,
     source_label: str = _DEFAULT_SOURCE_LABEL,
+    variables: dict[str, Any] | None = None,
 ) -> SISchematic:
     """
     Load a SignalIntegrity schematic from disk and validate it for SI-QFI use.
@@ -120,6 +121,29 @@ def load_schematic(
         ref of the schematic's voltage/current source device — the
         reference point for relative transfer functions and the drive
         injection point. Default 'VSource'.
+    variables : dict, optional
+        Overrides for the schematic's own named SI project variables (a
+        schematic-level parametrization mechanism -- see PartProperty
+        values of the form `=VariableName` in the .si XML, and the
+        top-level `<Variables><Items><Variable>...` section that declares
+        them, e.g. tests/test_schematic_impedance_mismatch.si). Passed
+        straight through to `SignalIntegrityAppHeadless.OpenProjectFile()`'s
+        own `args` parameter -- SI's OWN mechanism for this (verified
+        directly against SignalIntegrity/App/SignalIntegrityAppHeadless.py:
+        `OpenProjectFile(filename, args={})` calls `self.SetVariables(args,
+        True)` right after reading the project, matching each key against
+        the schematic's declared `<Variables>` names). Keys not matching
+        any declared variable are silently ignored by SI itself (not an
+        error here) -- SI's own SetVariables() only *prints* a warning for
+        an unmatched key (reportMissing=True), it doesn't raise; this
+        wrapper doesn't add stricter validation on top since a schematic's
+        variable set isn't otherwise introspectable from outside SI's own
+        Project object. Applied once, before any transfer function is
+        extracted (extraction is cached per si_app -- see
+        schematic/transfer_function.py's _get_transfer_parameters -- so
+        this is the only safe time to set them; changing a variable on an
+        already-extracted-from si_app would silently use the stale cache).
+        None (default) behaves exactly as before this parameter existed.
 
     Returns
     -------
@@ -148,7 +172,7 @@ def load_schematic(
         ) from e
 
     app = SignalIntegrityAppHeadless()
-    if not app.OpenProjectFile(str(path)):
+    if not app.OpenProjectFile(str(path), args=(variables or {})):
         raise ValueError(f"Failed to open SignalIntegrity project file: {path}")
 
     port_names = _extract_port_names(app)

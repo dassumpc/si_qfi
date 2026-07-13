@@ -12,8 +12,11 @@ Typical usage
 ...                     nonlinear=nl_nodes, noise=noise_nodes,
 ...                     n_realizations=200)
 >>> qubit     = siq.quantum.Transmon(Ej_GHz=20.0, Ec_MHz=200.0, n_levels=5)
->>> fid       = siq.quantum.gate_fidelity(result, qubit, ideal_gate="X")
+>>> fid       = siq.quantum.gate_fidelity(result, qubit, coupling_strength_per_volt=2e7,
+...                                       ideal_gate="X")
 >>> print(fid.F_avg)
+>>> fid.propagators        # per-realization channel (unitary, or superoperator if T1_us/T2_us given)
+>>> fid.final_states()     # apply those channels to |0> (or any state you pass in) -> density matrices
 """
 
 from .schematic.loader import load_schematic

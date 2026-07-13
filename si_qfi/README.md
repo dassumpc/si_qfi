@@ -2,7 +2,18 @@
 
 Bridges **SignalIntegrity** drive-chain simulation with **QuTiP** gate fidelity analysis.
 
-See `SI_Quantum_Fidelity_Plugin_PRD.md` for the full project definition.
+See `SI_Quantum_Fidelity_Plugin_PRD.md` for the full project definition, and
+`SI_QFI_Cursor_Handoff.md` for implementation-status detail on the SI/QuTiP
+integration points. **`INVESTIGATIONS.md` is a running report log of physics
+investigations built on top of this bridge** (nonlinearity vs. gate fidelity,
+bandwidth/dispersion, impedance mismatch/reflections, etc.) — read it for
+worked examples of what this codebase is actually for.
+
+**Status: the SI↔QuTiP bridge is fully wired up and tested.** Schematic
+loading, transfer-function extraction, and the QuTiP fidelity backend are
+all implemented, verified against real schematics, and covered by the test
+suite — see `SI_QFI_Cursor_Handoff.md` for the detailed history of each
+piece if you need it.
 
 ---
 
@@ -22,16 +33,20 @@ si_qfi/
 │   └── propagation.py        NoisePropagator: per-node noise → qubit plane
 ├── simulation/engine.py      Two-pass NL + noise engine, compare_modes()
 ├── schematic/
-│   ├── loader.py             *** CURSOR: SI schematic loading API ***
-│   └── transfer_function.py  *** CURSOR: SI S-parameter → transfer function ***
-├── quantum/__init__.py       QuTiP H(t) builder, fidelity, Transmon model
-│                             *** CURSOR: verify QuTiP v5 API calls ***
-└── tests/test_nonlinear.py   Unit tests (no SI or QuTiP required)
+│   ├── loader.py             SI schematic loading, incl. schematic-level
+│   │                         variable overrides (load_schematic(variables=...))
+│   └── transfer_function.py  SI S-parameter → transfer function extraction
+├── quantum/__init__.py       QuTiP H(t) builder, gate_fidelity(), Transmon model
+└── tests/                    Full test suite (nonlinear/noise/engine/schematic/
+                              quantum, unit + SI/QuTiP-backed integration tests)
+
+examples/                     Runnable investigation demos, one per INVESTIGATIONS.md section
+INVESTIGATIONS.md             Running report log of physics findings from the examples/ demos
 ```
 
 ---
 
-## What is implemented (no SI/QuTiP needed)
+## What is implemented
 
 - All nonlinear models: Saleh (baseband + real-axis variant), Volterra
 - Noise PSD computation from all spec types
@@ -39,35 +54,15 @@ si_qfi/
 - NoisePropagator (two-pass architecture)
 - Simulation engine two-pass loop
 - Diagnostic checks (isolation, harmonic suppression, narrowband)
-- Quantum module: Transmon H₀, gate unitary library, FidelityResult
-- Unit tests for all of the above
-
-## What Cursor needs to complete
-
-### 1. `schematic/loader.py` — SignalIntegrity API
-All functions marked `# --- CURSOR NOTE ---`. Key tasks:
-- `_extract_port_names(si_app)`: enumerate VoltageProbe labels from schematic
-- `_check_voltage_source_present(si_app)`: find VoltageSource device
-
-Nonlinear/noise node identity and order come from the `nonlinear`/`noise` dicts
-passed to `siq.run()`, not from schematic scanning — see `validate_node_labels()`
-in this file (already implemented, no SI API needed).
-
-Start with the SI repo's `SignalIntegrityAppHeadless` class and inspect
-`app.schematic.deviceList` to understand device enumeration.
-
-### 2. `schematic/transfer_function.py` — SI S-parameter extraction
-Key function: `_extract_single_tf(si_app, label_in, label_out, ...)`:
-- Call `si_app.SParameters()` to get S-parameter matrix
-- Map probe labels to port indices
-- Extract H(f) = sp[freq][port_out][port_in]
-- Call `_to_impulse_response(...)` (already implemented)
-
-### 3. `quantum/__init__.py` — QuTiP v5 API verification
-Marked with `# --- CURSOR NOTE ---`. Verify:
-- `qt.propagator(H, T, c_ops=[], tlist=tlist)` calling convention
-- `qt.average_gate_fidelity(U_actual, U_ideal)` function name and arg order
-- `qt.QobjEvo([H0, [op, coeff_array]], tlist=t_array)` array coefficient interface
+- SI schematic loading (`schematic/loader.py`), including passing
+  schematic-level `<Variables>` overrides through SI's own
+  `OpenProjectFile(args=...)` mechanism
+- SI transfer-function extraction (`schematic/transfer_function.py`), both
+  baseband and real-axis impulse response conversion
+- Quantum module: Transmon H₀, gate/state fidelity (`gate_fidelity()`),
+  optional T1/T2 Lindblad decay, propagators and final states
+- Unit tests for all of the above, plus SI/QuTiP-backed integration tests
+  and the `examples/` investigation demos
 
 ---
 
@@ -89,16 +84,20 @@ this `si_qfi/` package folder, is the most common cause of
 `ModuleNotFoundError: si_qfi` — there is no `si_qfi` package nested inside
 itself for Python to find.)
 
-## Running tests (no SI or QuTiP required)
+## Running tests
 
 ```bash
 pip install pytest
-pytest tests/test_nonlinear.py -v
+pytest tests/ -v
 ```
+
+Tests that need SignalIntegrity or QuTiP `pytest.importorskip` themselves and
+are skipped automatically if those packages aren't installed; the nonlinear/
+noise/PSD unit tests run with only numpy/scipy.
 
 ---
 
-## Quick usage (once SI and QuTiP are wired up)
+## Quick usage
 
 ```python
 import si_qfi as siq
@@ -117,14 +116,20 @@ result = siq.run(
     mode           = "complex_baseband",
 )
 
-qubit = siq.quantum.Transmon(Ej_GHz=20.0, Ec_MHz=200.0, n_levels=5)
+qubit = siq.quantum.QubitModel(H0=..., n_levels=2)  # or siq.quantum.Transmon(...)
 
 fid = siq.quantum.gate_fidelity(
-    v_qubit_ensemble           = result.v_qubit_ensemble,
-    t_array                    = result.t_array,
-    qubit                      = qubit,
+    result,
+    qubit,
     ideal_gate                 = "X",
     coupling_strength_per_volt = 2e7,
 )
 print(f"F = {fid.F_avg:.5f} ± {fid.F_sem:.6f}")
 ```
+
+`load_schematic()` also accepts a `variables={...}` dict to override any
+`<Variables>` declared in the `.si` schematic file itself (see
+`tests/test_schematic_impedance_mismatch.si` and Investigation 5 in
+`INVESTIGATIONS.md` for a worked example).
+
+See `examples/` for complete, runnable end-to-end demos.
