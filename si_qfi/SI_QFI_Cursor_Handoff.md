@@ -57,8 +57,12 @@ si_qfi/
 │   ├── loader.py                     ✅ SI schematic loading, incl. variables= override
 │   └── transfer_function.py          ✅ SI S-parameter → transfer function
 │
-├── quantum/
-│   └── __init__.py                   ✅ gate_fidelity(), Transmon/QubitModel, T1/T2 Lindblad
+├── quantum/                           ✅ split 2026-07-13 (was one large __init__.py)
+│   ├── __init__.py                   ✅ thin re-export of the public API below
+│   ├── models.py                     ✅ QubitBase, QubitModel, Transmon, from_scqubits
+│   ├── hamiltonian.py                ✅ build_hamiltonian(), demodulate()
+│   └── fidelity.py                   ✅ FidelityResult (noise_free/noise split), gate_fidelity(),
+│                                         tuneup_amplitude(), T1/T2 Lindblad
 │
 ├── output/
 │   └── __init__.py                   🔲 Phase 3 stub
@@ -219,9 +223,10 @@ waveform's fs — the waveform is resampled to match instead
 
 ---
 
-## Cursor Task 3: quantum/__init__.py — QuTiP v5 API — DONE
+## Cursor Task 3: quantum/fidelity.py — QuTiP v5 API — DONE
 
-**File:** `si_qfi/quantum/__init__.py`
+**File:** `si_qfi/quantum/fidelity.py` (moved out of `quantum/__init__.py` 2026-07-13, see
+the repo structure table above — `__init__.py` is now a thin re-export)
 **Status:** Fully implemented, verified against QuTiP 5.0.4 (installed via
 PyPI — the local git clone needs Python 3.11, which wasn't available), and
 exercised end-to-end by a 2-level Rabi oscillation demo
@@ -229,11 +234,13 @@ exercised end-to-end by a 2-level Rabi oscillation demo
 `INVESTIGATIONS.md`.
 
 `gate_fidelity()` takes the whole `SimulationResult` object directly, not
-separate `v_qubit_ensemble`/`t_array` arguments:
+separate `v_qubit_ensemble`/`t_array` arguments, and `qubit` is typed
+against the `QubitBase` ABC (any type implementing `as_qubit_model()`, not
+an `isinstance()` check against a hardcoded list of qubit classes):
 ```python
 def gate_fidelity(
     result: "SimulationResult",
-    qubit: "Transmon | QubitModel",
+    qubit: QubitBase,
     coupling_strength_per_volt: float,
     ideal_gate: Optional[Union[str, Any]] = None,
     target_state: Optional[Any] = None,
@@ -244,9 +251,27 @@ def gate_fidelity(
 ) -> FidelityResult:
 ```
 At least one of `ideal_gate` (a string name or a custom `qt.Qobj`/ndarray
-unitary) or `target_state` must be given. `FidelityResult` also carries
-`.propagators` (list of `Qobj`, unitary or superoperator) and a
-`.final_states(initial_state=None)` method, populated at no extra cost.
+unitary) or `target_state` must be given.
+
+**`FidelityResult` shape (2026-07-13):** split into `.noise_free` (a
+`SingleFidelity` — always populated, ONE solve on `result.v_nl_qubit`) and
+`.noise` (a `NoiseEnsembleFidelity` — populated, with `.F_avg`/`.F_std`/
+`.F_sem`/`.propagators` (plural)/`.final_states()` (plural), only when
+`result.noise_enabled` is True, i.e. `engine.run()` was given a non-empty
+`noise` dict; `None` otherwise). Before this split, a noise-free evaluation
+was represented as `n_realizations` redundant identical solves — this both
+fixes that waste and makes "was real noise involved" explicit rather than
+inferred. `SingleFidelity.propagator`/`.final_state(initial_state=None)`
+are the singular equivalents of `NoiseEnsembleFidelity.propagators`/
+`.final_states()`, all populated at no extra solve cost.
+
+**`tuneup_amplitude()` (2026-07-13):** shared calibration helper —
+searches a real amplitude scale factor for a reference envelope to
+maximize the requested (noise-free) fidelity, replacing ~12 near-duplicated
+hand-rolled calibration loops across `examples/`/`tests/`. See its own
+docstring in `quantum/fidelity.py` for the three-stage strategy (analytic
+guess for known rotation targets → coarse fidelity scan → bounded local
+refinement) and `INVESTIGATIONS.md`/the demo scripts for usage.
 
 **A real bug found here, not just an API-naming question:** QuTiP's adaptive
 ODE solver (`sesolve`/`propagator`) will silently skip over an entire pulse

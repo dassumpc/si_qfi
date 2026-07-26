@@ -37,8 +37,6 @@ ETA = 2 * np.pi * 10e6      # rad/(s.V) drive coupling
 DURATION_S = 100e-9         # 100 ns gate window
 SIGMA_S = DURATION_S / 6
 FS_ENVELOPE = 2e9           # 2 GSa/s baseband envelope grid
-LPF_CUTOFF_HZ = 500e6       # real-axis demod low-pass (>> pulse BW ~10MHz,
-                             # << 2*carrier image at 10 GHz)
 N_SWEEP = 41                # sweep points, theta/pi in [0, 2.2]
 
 
@@ -61,35 +59,6 @@ def _realized_theta(result, eta: float, lpf_cutoff_hz=None) -> float:
     return float(eta * np.trapz(env_i, t))
 
 
-def _population_1(result, qmodel, eta: float, lpf_cutoff_hz=None) -> float:
-    """
-    Probability of finding the qubit in |1> at the end of the gate, starting
-    from |0> -- the quantity a real Rabi-flopping measurement (e.g. readout
-    vs. pulse amplitude) would report. Mirrors quantum.gate_fidelity()'s own
-    internals (including its max_step/nsteps fix -- see quantum/__init__.py)
-    but solves the state directly via sesolve rather than the full
-    propagator, since only one input state (|0>) is needed here.
-    """
-    v = np.asarray(result.v_qubit_ensemble[0])
-    fs = result.fs
-    t_array = np.arange(len(v)) / fs
-    dt = 1.0 / fs
-    if result.mode == "complex_baseband":
-        env_i = np.ascontiguousarray(np.real(v))
-        env_q = np.ascontiguousarray(np.imag(v))
-    else:
-        env_i, env_q = quantum.demodulate(v, t_array, result.carrier_freq_hz, lpf_cutoff_hz)
-        env_i = np.ascontiguousarray(env_i)
-        env_q = np.ascontiguousarray(env_q)
-
-    H = quantum.build_hamiltonian(qmodel, env_i, env_q, t_array, eta)
-    psi0 = qutip.basis(qmodel.n_levels, 0)
-    solver_options = {"max_step": dt, "nsteps": max(10_000, 20 * len(v))}
-    res = qutip.sesolve(H, psi0, t_array, options=solver_options)
-    psi_final = res.states[-1]
-    return float(np.abs(psi_final.full()[1, 0]) ** 2)
-
-
 def _calibrate_amp_pi(schematic, mode: str, eta: float, lpf_cutoff_hz=None) -> np.ndarray:
     """One reference run -> exact (linear system) amplitude scale hitting
     theta=pi. Returns the reference SHAPE array already scaled to a pi-pulse."""
@@ -103,6 +72,16 @@ def _calibrate_amp_pi(schematic, mode: str, eta: float, lpf_cutoff_hz=None) -> n
 
 
 def sweep_mode(schematic, mode: str, qmodel, thetas_over_pi: np.ndarray, lpf_cutoff_hz=None):
+    """
+    For each pulse area, run the full engine.run() -> quantum.gate_fidelity()
+    pipeline once and read BOTH the |1> population and the gate fidelity off
+    that single call -- population comes from FidelityResult.final_states()
+    (the density matrix from the propagator gate_fidelity() already had to
+    compute, at zero extra solve cost), rather than a second, independent
+    sesolve reimplementation. This means the population curve actually
+    exercises quantum.gate_fidelity()'s own solver path (including its
+    max_step/nsteps fix), not a hand-rolled duplicate of it.
+    """
     pi_shape = _calibrate_amp_pi(schematic, mode, ETA, lpf_cutoff_hz)
     populations = np.zeros_like(thetas_over_pi)
     fidelities = np.zeros_like(thetas_over_pi)
@@ -112,12 +91,13 @@ def sweep_mode(schematic, mode: str, qmodel, thetas_over_pi: np.ndarray, lpf_cut
         result = engine.run(
             schematic, source, nonlinear=None, noise=None, n_realizations=1, mode=mode,
         )
-        populations[i] = _population_1(result, qmodel, ETA, lpf_cutoff_hz)
         fid = quantum.gate_fidelity(
             result, qmodel, ideal_gate="X", coupling_strength_per_volt=ETA,
             lpf_cutoff_hz=lpf_cutoff_hz,
         )
-        fidelities[i] = fid.F_avg
+        fidelities[i] = fid.noise_free.F_avg
+        rho_final = fid.noise_free.final_state()   # default initial_state is |0>
+        populations[i] = np.real(rho_final.full()[1, 1])
     return populations, fidelities
 
 
@@ -140,7 +120,7 @@ def main():
     pop_bb, fid_bb = sweep_mode(schematic, "complex_baseband", qmodel, thetas_over_pi)
 
     print("Sweeping real_axis mode...")
-    pop_ra, fid_ra = sweep_mode(schematic, "real_axis", qmodel, thetas_over_pi, LPF_CUTOFF_HZ)
+    pop_ra, fid_ra = sweep_mode(schematic, "real_axis", qmodel, thetas_over_pi)
 
     pop_analytic = np.sin(np.pi * thetas_over_pi / 2.0) ** 2
 

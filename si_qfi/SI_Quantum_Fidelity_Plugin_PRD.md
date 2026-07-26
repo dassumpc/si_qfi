@@ -872,11 +872,31 @@ fidelity_result = siq.quantum.gate_fidelity(
     T2_us = 30.0,
 )
 
-print(f"Gate fidelity: {fidelity_result.F_avg:.5f} ± {fidelity_result.F_sem:.6f}")
+# fidelity_result.noise_free (a SingleFidelity) is ALWAYS populated -- one
+# solve on the deterministic result.v_nl_qubit, no noise realizations
+# involved. fidelity_result.noise (a NoiseEnsembleFidelity) is populated
+# here specifically because noise_nodes above was non-empty -- it's None
+# whenever engine.run() was called with noise=None (or an empty dict).
+print(f"Noise-free gate fidelity: {fidelity_result.noise_free.F_avg:.5f}")
+if fidelity_result.noise is not None:
+    print(f"Ensemble gate fidelity:   {fidelity_result.noise.F_avg:.5f} "
+          f"± {fidelity_result.noise.F_sem:.6f}  (N={fidelity_result.noise.n_realizations})")
 siq.output.plot_waveform(result)
-fidelity_result.plot_fidelity_hist()
 # Fidelity budget decomposition (siq.sweep.budget) is a Phase 3 feature, not
 # yet implemented -- see §13.
+
+# 7. Calibration helper: tuneup_amplitude() searches an amplitude scale
+# factor for a reference envelope shape to maximize the requested fidelity
+# (gate or state -- same ideal_gate/target_state contract as gate_fidelity()
+# above), replacing hand-rolled per-script calibration loops. Optimizes the
+# noise-free fidelity only; call gate_fidelity() yourself on the returned
+# .result for a final noisy/decohered number, as above.
+tuned = siq.quantum.tuneup_amplitude(
+    schematic, reference_shape=my_envelope_array, fs_envelope=2e9, carrier_ghz=5.0,
+    qubit=qubit, coupling_strength_per_volt=2e7, ideal_gate="X",
+)
+print(f"Tuned scale={tuned.scale:.4f}  achieved={tuned.achieved}  "
+      f"F_avg={tuned.fidelity.noise_free.F_avg:.5f}")
 
 # fidelity_result.propagators is always populated (one QuTiP Qobj per
 # realization -- a unitary, or a superoperator if T1_us/T2_us were given)

@@ -70,8 +70,7 @@ import qutip
 
 from si_qfi.schematic import loader as si_loader
 from si_qfi.schematic import transfer_function as si_tf
-from si_qfi.simulation import engine
-from si_qfi.source.waveform import SourceWaveform, build_gaussian_envelope
+from si_qfi.source.waveform import build_gaussian_envelope
 from si_qfi import quantum
 
 # Resolved BEFORE any schematic is opened -- SignalIntegrityAppHeadless's
@@ -93,45 +92,22 @@ LPF_CUTOFF_HZ = 500e6
 DURATIONS_S = np.array([50e-9, 100e-9, 200e-9, 400e-9, 800e-9, 1600e-9])
 
 
-def _source_from_shape(shape: np.ndarray, fs: float, carrier_ghz: float) -> SourceWaveform:
-    from SignalIntegrity.Lib.TimeDomain.Waveform.Waveform import Waveform
-    from SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor import TimeDescriptor
-
-    n = len(shape)
-    envelope = Waveform(TimeDescriptor(0.0, n, fs), list(shape.astype(complex)))
-    return SourceWaveform(carrier_freq_ghz=carrier_ghz, envelope=envelope)
-
-
 def infidelity_no_nl(schematic, duration_s, qmodel, mode="complex_baseband", lpf_cutoff_hz=None):
     """
-    Self-calibrated pi-pulse infidelity with NO nonlinearity anywhere --
-    isolates pure linear-channel dispersion. Two engine.run() passes
-    (reference amplitude, then exact rescale) suffice here because the
-    WHOLE chain is linear -- no NL node means the amplitude->theta map is
-    exactly proportional, unlike the iterative search
-    two_amp_harmonic_remixing_demo.py needs once a real nonlinearity is
-    in the loop.
+    tuneup_amplitude()-calibrated pi-pulse infidelity with NO nonlinearity
+    anywhere -- isolates pure linear-channel dispersion. The whole chain
+    is linear here, so tuneup_amplitude()'s analytic-guess fast path
+    (2 engine.run() calls) handles every point, same cost as the
+    hand-rolled version this replaces.
     """
     sigma_s = duration_s / 6
     ref_shape = build_gaussian_envelope(duration_s, sigma_s, FS_ENVELOPE, amp=1.0)
-    source_ref = _source_from_shape(ref_shape, FS_ENVELOPE, CARRIER_GHZ)
-    result_ref = engine.run(schematic, source_ref, nonlinear=None, noise=None, n_realizations=1, mode=mode)
-    v = np.asarray(result_ref.v_nl_qubit)
-    t = np.arange(len(v)) / result_ref.fs
-    if mode == "complex_baseband":
-        env_i = np.real(v)
-    else:
-        env_i, _ = quantum.demodulate(v, t, CARRIER_GHZ * 1e9, lpf_cutoff_hz)
-    theta_ref = float(ETA * np.trapz(env_i, t))
-    scale = np.pi / theta_ref
-
-    cal_shape = ref_shape * scale
-    source_cal = _source_from_shape(cal_shape, FS_ENVELOPE, CARRIER_GHZ)
-    result_cal = engine.run(schematic, source_cal, nonlinear=None, noise=None, n_realizations=1, mode=mode)
-    fid = quantum.gate_fidelity(
-        result_cal, qmodel, coupling_strength_per_volt=ETA, ideal_gate="X", lpf_cutoff_hz=lpf_cutoff_hz,
+    tuned = quantum.tuneup_amplitude(
+        schematic, ref_shape, FS_ENVELOPE, CARRIER_GHZ,
+        qmodel, coupling_strength_per_volt=ETA, ideal_gate="X",
+        mode=mode, lpf_cutoff_hz=lpf_cutoff_hz,
     )
-    return 1.0 - fid.F_avg
+    return 1.0 - tuned.fidelity.noise_free.F_avg
 
 
 def envelope_bandwidth_hz(duration_s):

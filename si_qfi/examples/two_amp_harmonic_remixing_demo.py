@@ -82,17 +82,13 @@ Requires: SignalIntegrity, QuTiP, matplotlib.
 """
 from __future__ import annotations
 
-import warnings
 from pathlib import Path
 
 import numpy as np
 import qutip
-from scipy.signal import fftconvolve
 
 from si_qfi.schematic import loader as si_loader
-from si_qfi.schematic import transfer_function as si_tf
-from si_qfi.simulation import engine
-from si_qfi.source.waveform import SourceWaveform, build_gaussian_envelope
+from si_qfi.source.waveform import build_gaussian_envelope
 from si_qfi.nonlinear.saleh import SalehModel, SalehRealAxisModel
 from si_qfi import quantum
 
@@ -120,116 +116,6 @@ FS_ENVELOPE = 8e9        # see nonlinearity_fidelity_demo.py -- 2 GSa/s left a
 LPF_CUTOFF_HZ = 500e6
 
 
-# ---------------------------------------------------------------------------
-# Two-stage calibration (generalizes nonlinearity_fidelity_demo.py's
-# single-node calibrate_and_run to a chain of up to two NL nodes; either
-# may be None for a "single-stage" comparison run through the SAME
-# schematic/channel).
-# ---------------------------------------------------------------------------
-
-def _source_from_shape(shape: np.ndarray, fs: float, carrier_ghz: float) -> SourceWaveform:
-    from SignalIntegrity.Lib.TimeDomain.Waveform.Waveform import Waveform
-    from SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor import TimeDescriptor
-
-    n = len(shape)
-    envelope = Waveform(TimeDescriptor(0.0, n, fs), list(shape.astype(complex)))
-    return SourceWaveform(carrier_freq_ghz=carrier_ghz, envelope=envelope)
-
-
-def _pre_nl_waveform(schematic, source, mode, mid_label=NODE_1):
-    raw = si_tf._extract_single_tf(schematic.si_app, schematic.source_label, mid_label, schematic.source_label)
-    h = si_tf.compute_impulse_response(raw, mode, fs=source.fs, carrier_hz=source.carrier_freq_hz).h
-    if mode == "real_axis":
-        fs_native = si_tf.native_sample_rate(raw)
-        _, v_initial = source.rf_waveform_at(fs_native)
-        fs_out = fs_native
-    else:
-        v_initial = source.envelope_complex
-        fs_out = source.fs
-    return np.convolve(v_initial, h, mode="full"), fs_out
-
-
-def _segment_h(schematic, source, mode, label_in, label_out):
-    raw = si_tf._extract_single_tf(schematic.si_app, label_in, label_out, schematic.source_label)
-    return si_tf.compute_impulse_response(raw, mode, fs=source.fs, carrier_hz=source.carrier_freq_hz).h
-
-
-def calibrate_and_run(
-    schematic, mode, nl1_fn, nl2_fn, target_theta=np.pi,
-    lpf_cutoff_hz=None, scale_lo=1e-4, scale_hi=1000.0, n_scan=80, n_bisect=35,
-):
-    """
-    Self-calibrate a Gaussian I-only pulse to hit target_theta radians of
-    rotation through UP TO TWO cascaded nonlinear stages (nl1_fn at
-    NODE_1, nl2_fn at NODE_2 -- either may be None to model only one
-    stage being nonlinear, e.g. for a "single-stage" comparison run
-    through this SAME two-amplifier schematic/channel), then runs the
-    full engine.run() pipeline once at the calibrated amplitude.
-
-    Returns (result_or_None, achieved: bool, theta_hit_or_max_achievable).
-    Same non-monotonic-theta caveat as nonlinearity_fidelity_demo.py's
-    calibrate_and_run() -- coarse scan brackets the rising branch first.
-    """
-    ref_shape = build_gaussian_envelope(DURATION_S, SIGMA_S, FS_ENVELOPE, amp=1.0)
-    source_ref = _source_from_shape(ref_shape, FS_ENVELOPE, CARRIER_GHZ)
-    v_pre1, fs_pre = _pre_nl_waveform(schematic, source_ref, mode, NODE_1)
-    h_mid = _segment_h(schematic, source_ref, mode, NODE_1, NODE_2)
-    h_post = _segment_h(schematic, source_ref, mode, NODE_2, schematic.qubit_probe_label)
-
-    def theta_for_scale(scale):
-        nl1 = nl1_fn() if nl1_fn else None
-        nl2 = nl2_fn() if nl2_fn else None
-        if mode == "complex_baseband":
-            v_nl1 = nl1.apply_baseband(v_pre1 * scale) if nl1 else v_pre1 * scale
-            v_pre2 = fftconvolve(v_nl1, h_mid, mode="full")
-            v_nl2 = nl2.apply_baseband(v_pre2) if nl2 else v_pre2
-        else:
-            v_nl1 = nl1.apply_real_axis(v_pre1 * scale) if nl1 else v_pre1 * scale
-            v_pre2 = fftconvolve(v_nl1, h_mid, mode="full")
-            v_nl2 = nl2.apply_real_axis(v_pre2) if nl2 else v_pre2
-        v_post = fftconvolve(v_nl2, h_post, mode="full")
-        t = np.arange(len(v_post)) / fs_pre
-        if mode == "complex_baseband":
-            env_i = np.real(v_post)
-        else:
-            env_i, _ = quantum.demodulate(v_post, t, CARRIER_GHZ * 1e9, lpf_cutoff_hz)
-        return float(ETA * np.trapz(env_i, t)), v_post
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        scales = np.geomspace(scale_lo, scale_hi, n_scan)
-        thetas = np.array([theta_for_scale(s)[0] for s in scales])
-        if thetas[int(np.argmax(thetas >= target_theta))] < target_theta:
-            return None, False, float(thetas.max())
-
-        idx = int(np.argmax(thetas >= target_theta))
-        lo, hi = scales[max(idx - 1, 0)], scales[idx]
-        for _ in range(n_bisect):
-            mid = 0.5 * (lo + hi)
-            th, _ = theta_for_scale(mid)
-            if th < target_theta:
-                lo = mid
-            else:
-                hi = mid
-        scale = 0.5 * (lo + hi)
-        theta_hit, v_post_hit = theta_for_scale(scale)
-
-    cal_shape = ref_shape * scale
-    source_cal = _source_from_shape(cal_shape, FS_ENVELOPE, CARRIER_GHZ)
-    nl_spec = {}
-    if nl1_fn:
-        nl_spec[NODE_1] = nl1_fn.spec()
-    if nl2_fn:
-        nl_spec[NODE_2] = nl2_fn.spec()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        result = engine.run(
-            schematic, source_cal, nonlinear=nl_spec if nl_spec else None,
-            noise=None, n_realizations=1, mode=mode,
-        )
-    return result, True, (theta_hit, v_post_hit)
-
-
 class SalehFn:
     """nl_model_fn for either baseband SalehModel or real-axis SalehRealAxisModel."""
     def __init__(self, op1db, cls=SalehModel):
@@ -242,14 +128,29 @@ class SalehFn:
         return {"model": "saleh", "op1db_amplitude": self.op1db}
 
 
-def fidelity_at(schematic, mode, nl1_fn, nl2_fn, qmodel, lpf_cutoff_hz=None):
-    result, achieved, extra = calibrate_and_run(schematic, mode, nl1_fn, nl2_fn, lpf_cutoff_hz=lpf_cutoff_hz)
-    if not achieved:
-        return None, False
-    fid = quantum.gate_fidelity(
-        result, qmodel, coupling_strength_per_volt=ETA, ideal_gate="X", lpf_cutoff_hz=lpf_cutoff_hz,
+def _tune(schematic, mode, nl1_fn, nl2_fn, qmodel, lpf_cutoff_hz=None):
+    """tuneup_amplitude() with the two-node nonlinear= dict this schematic
+    needs -- generalizes the old calibrate_and_run() to 0/1/2 NL nodes
+    without any special-casing (nl1_fn/nl2_fn=None simply omit that node's
+    entry from the dict passed straight through to engine.run())."""
+    ref_shape = build_gaussian_envelope(DURATION_S, SIGMA_S, FS_ENVELOPE, amp=1.0)
+    nl_spec = {}
+    if nl1_fn:
+        nl_spec[NODE_1] = nl1_fn.spec()
+    if nl2_fn:
+        nl_spec[NODE_2] = nl2_fn.spec()
+    return quantum.tuneup_amplitude(
+        schematic, ref_shape, FS_ENVELOPE, CARRIER_GHZ,
+        qmodel, coupling_strength_per_volt=ETA, ideal_gate="X",
+        nonlinear=nl_spec if nl_spec else None, mode=mode, lpf_cutoff_hz=lpf_cutoff_hz,
     )
-    return 1.0 - fid.F_avg, True
+
+
+def fidelity_at(schematic, mode, nl1_fn, nl2_fn, qmodel, lpf_cutoff_hz=None):
+    tuned = _tune(schematic, mode, nl1_fn, nl2_fn, qmodel, lpf_cutoff_hz)
+    if not tuned.achieved:
+        return None, False
+    return 1.0 - tuned.fidelity.noise_free.F_avg, True
 
 
 def baseline_infidelity(schematic, mode, qmodel, lpf_cutoff_hz=None):
@@ -321,13 +222,14 @@ def main():
     # to visualize the 3rd-harmonic content physically responsible.
     illustrative_op1db = op1db_sweep[arrs["ra_two_ok"] & ~arrs["ra_single_ok"]].max() \
         if (arrs["ra_two_ok"] & ~arrs["ra_single_ok"]).any() else op1db_sweep[arrs["ra_two_ok"]].min()
-    result_illustrative, ok_ill, _ = calibrate_and_run(
+    tuned_illustrative = _tune(
         schematic, "real_axis", SalehFn(illustrative_op1db, SalehRealAxisModel),
-        SalehFn(illustrative_op1db, SalehRealAxisModel), lpf_cutoff_hz=LPF_CUTOFF_HZ,
+        SalehFn(illustrative_op1db, SalehRealAxisModel), qmodel, lpf_cutoff_hz=LPF_CUTOFF_HZ,
     )
+    ok_ill = tuned_illustrative.achieved
     if ok_ill:
-        v_final = result_illustrative.v_nl_qubit
-        fs_final = result_illustrative.fs
+        v_final = tuned_illustrative.result.v_nl_qubit
+        fs_final = tuned_illustrative.result.fs
         freqs = np.fft.rfftfreq(len(v_final), 1.0 / fs_final)
         spectrum = np.abs(np.fft.rfft(v_final))
 

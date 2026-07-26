@@ -28,17 +28,13 @@ Requires: SignalIntegrity, QuTiP, matplotlib.
 """
 from __future__ import annotations
 
-import warnings
 from pathlib import Path
 
 import numpy as np
 import qutip
-from scipy.signal import fftconvolve
 
 from si_qfi.schematic import loader as si_loader
-from si_qfi.schematic import transfer_function as si_tf
-from si_qfi.simulation import engine
-from si_qfi.source.waveform import SourceWaveform, build_gaussian_envelope
+from si_qfi.source.waveform import build_gaussian_envelope
 from si_qfi.nonlinear.saleh import SalehModel, SalehRealAxisModel
 from si_qfi.nonlinear.volterra import VolterraModel
 from si_qfi import quantum
@@ -61,104 +57,6 @@ SIGMA_S = DURATION_S / 6
 FS_ENVELOPE = 8e9
 LPF_CUTOFF_HZ = 500e6
 NL_LABEL = "DriverOutput"
-
-
-# ---------------------------------------------------------------------------
-# Calibration machinery (see tests/test_quantum_nonlinear.py for the full
-# rationale -- theta(scale) is NOT monotonic for a Saleh/Volterra AM-AM
-# curve pushed far enough, so this brackets the RISING branch via a coarse
-# scan before bisecting, and reports "not achievable" rather than
-# converging to a wrong point if the target is out of reach entirely).
-# ---------------------------------------------------------------------------
-
-def _source_from_shape(shape: np.ndarray, fs: float, carrier_ghz: float) -> SourceWaveform:
-    from SignalIntegrity.Lib.TimeDomain.Waveform.Waveform import Waveform
-    from SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor import TimeDescriptor
-
-    n = len(shape)
-    envelope = Waveform(TimeDescriptor(0.0, n, fs), list(shape.astype(complex)))
-    return SourceWaveform(carrier_freq_ghz=carrier_ghz, envelope=envelope)
-
-
-def _pre_nl_waveform(schematic, source, mode, mid_label=NL_LABEL):
-    raw = si_tf._extract_single_tf(schematic.si_app, schematic.source_label, mid_label, schematic.source_label)
-    h = si_tf.compute_impulse_response(raw, mode, fs=source.fs, carrier_hz=source.carrier_freq_hz).h
-    if mode == "real_axis":
-        fs_native = si_tf.native_sample_rate(raw)
-        _, v_initial = source.rf_waveform_at(fs_native)
-        fs_out = fs_native
-    else:
-        v_initial = source.envelope_complex
-        fs_out = source.fs
-    return np.convolve(v_initial, h, mode="full"), fs_out
-
-
-def _segment_h(schematic, source, mode, label_in, label_out):
-    raw = si_tf._extract_single_tf(schematic.si_app, label_in, label_out, schematic.source_label)
-    return si_tf.compute_impulse_response(raw, mode, fs=source.fs, carrier_hz=source.carrier_freq_hz).h
-
-
-def calibrate_and_run(
-    schematic, mode, nl_model_fn, target_theta=np.pi,
-    lpf_cutoff_hz=None, scale_lo=1e-4, scale_hi=500.0, n_scan=60, n_bisect=30,
-):
-    """
-    Self-calibrate a Gaussian I-only pulse to hit target_theta radians of
-    rotation through nl_model_fn()'s actual nonlinearity, then run the full
-    engine.run() pipeline once at that amplitude.
-
-    Returns (result_or_None, achieved: bool, theta_hit_or_max_achievable).
-    """
-    ref_shape = build_gaussian_envelope(DURATION_S, SIGMA_S, FS_ENVELOPE, amp=1.0)
-    source_ref = _source_from_shape(ref_shape, FS_ENVELOPE, CARRIER_GHZ)
-    v_pre, fs_pre = _pre_nl_waveform(schematic, source_ref, mode)
-    h_post = _segment_h(schematic, source_ref, mode, NL_LABEL, schematic.qubit_probe_label)
-
-    def theta_for_scale(scale):
-        nl_model = nl_model_fn()
-        if mode == "complex_baseband":
-            v_nl = nl_model.apply_baseband(v_pre * scale)
-        else:
-            v_nl = nl_model.apply_real_axis(v_pre * scale)
-        v_post = fftconvolve(v_nl, h_post, mode="full")
-        t = np.arange(len(v_post)) / fs_pre
-        if mode == "complex_baseband":
-            env_i = np.real(v_post)
-        else:
-            env_i, _ = quantum.demodulate(v_post, t, CARRIER_GHZ * 1e9, lpf_cutoff_hz)
-        return float(ETA * np.trapz(env_i, t)), v_post
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        scales = np.geomspace(scale_lo, scale_hi, n_scan)
-        thetas = np.array([theta_for_scale(s)[0] for s in scales])
-        achievable_max = float(np.max(thetas))
-        idx = int(np.argmax(thetas >= target_theta))
-        if thetas[idx] < target_theta:
-            return None, False, achievable_max
-
-        lo, hi = scales[max(idx - 1, 0)], scales[idx]
-        for _ in range(n_bisect):
-            mid = 0.5 * (lo + hi)
-            th, _ = theta_for_scale(mid)
-            if th < target_theta:
-                lo = mid
-            else:
-                hi = mid
-        scale = 0.5 * (lo + hi)
-        theta_hit, v_post_hit = theta_for_scale(scale)
-
-    peak_at_nl = float(np.max(np.abs(v_pre * scale)))
-
-    cal_shape = ref_shape * scale
-    source_cal = _source_from_shape(cal_shape, FS_ENVELOPE, CARRIER_GHZ)
-    nl_spec = {NL_LABEL: nl_model_fn.spec()}
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        result = engine.run(
-            schematic, source_cal, nonlinear=nl_spec, noise=None, n_realizations=1, mode=mode,
-        )
-    return result, True, (theta_hit, peak_at_nl)
 
 
 class SalehSpec:
@@ -203,17 +101,22 @@ class VolterraSpec:
 
 
 def fidelity_at(schematic, mode, nl_model_fn, qmodel, lpf_cutoff_hz=None):
-    """Returns (infidelity, achieved, peak_dB_above_op1db) for one sweep point."""
-    result, achieved, extra = calibrate_and_run(schematic, mode, nl_model_fn, lpf_cutoff_hz=lpf_cutoff_hz)
-    if not achieved:
-        return None, False, None
-    theta_hit, peak_at_nl = extra
-    fid = quantum.gate_fidelity(
-        result, qmodel, coupling_strength_per_volt=ETA, ideal_gate="X",
-        lpf_cutoff_hz=lpf_cutoff_hz,
+    """Returns (infidelity, achieved) for one sweep point. tuneup_amplitude()
+    reuses this file's existing SalehSpec/SalehRealAxisSpec/VolterraSpec
+    classes' .spec() dict output (the same nonlinear= annotation engine.run()
+    always took), and reproduces the coarse-scan + bisection-on-the-rising-
+    branch strategy needed here (Saleh/Volterra AM-AM makes theta(scale)
+    non-monotonic once driven hard enough) internally."""
+    ref_shape = build_gaussian_envelope(DURATION_S, SIGMA_S, FS_ENVELOPE, amp=1.0)
+    nl_spec = {NL_LABEL: nl_model_fn.spec()}
+    tuned = quantum.tuneup_amplitude(
+        schematic, ref_shape, FS_ENVELOPE, CARRIER_GHZ,
+        qmodel, coupling_strength_per_volt=ETA, ideal_gate="X",
+        nonlinear=nl_spec, mode=mode, lpf_cutoff_hz=lpf_cutoff_hz,
     )
-    depth_db = 20 * np.log10(peak_at_nl / nl_model_fn.op1db)
-    return 1.0 - fid.F_avg, True, depth_db
+    if not tuned.achieved:
+        return None, False
+    return 1.0 - tuned.fidelity.noise_free.F_avg, True
 
 
 def main():
@@ -229,11 +132,11 @@ def main():
     # ------------------------------------------------------------------
     print("Panel A: baseband AM-AM only vs. compression severity...")
     op1db_sweep = np.geomspace(0.2, 15.0, 24)
-    infid_A, achieved_A, depth_A = [], [], []
+    infid_A, achieved_A = [], []
     for op1db in op1db_sweep:
         fn = SalehSpec(op1db, enable_am_pm=False)
-        infid, ok, depth = fidelity_at(schematic, "complex_baseband", fn, qmodel)
-        infid_A.append(infid); achieved_A.append(ok); depth_A.append(depth)
+        infid, ok = fidelity_at(schematic, "complex_baseband", fn, qmodel)
+        infid_A.append(infid); achieved_A.append(ok)
     infid_A = np.array([v if v is not None else np.nan for v in infid_A])
     achieved_A = np.array(achieved_A)
 
@@ -251,7 +154,7 @@ def main():
         vals = []
         for peak_deg in am_pm_sweep:
             fn = SalehSpec(op1db, enable_am_pm=(peak_deg > 0), am_pm_peak_deg=float(peak_deg))
-            infid, ok, _ = fidelity_at(schematic, "complex_baseband", fn, qmodel)
+            infid, ok = fidelity_at(schematic, "complex_baseband", fn, qmodel)
             vals.append(infid if ok else np.nan)
         infid_B[op1db] = np.array(vals)
 
@@ -264,9 +167,9 @@ def main():
     infid_C_saleh, achieved_C_saleh = [], []
     infid_C_volt, achieved_C_volt = [], []
     for op1db in op1db_sweep:
-        infid_s, ok_s, _ = fidelity_at(schematic, "real_axis", SalehRealAxisSpec(op1db), qmodel, LPF_CUTOFF_HZ)
+        infid_s, ok_s = fidelity_at(schematic, "real_axis", SalehRealAxisSpec(op1db), qmodel, LPF_CUTOFF_HZ)
         infid_C_saleh.append(infid_s); achieved_C_saleh.append(ok_s)
-        infid_v, ok_v, _ = fidelity_at(schematic, "real_axis", VolterraSpec(op1db), qmodel, LPF_CUTOFF_HZ)
+        infid_v, ok_v = fidelity_at(schematic, "real_axis", VolterraSpec(op1db), qmodel, LPF_CUTOFF_HZ)
         infid_C_volt.append(infid_v); achieved_C_volt.append(ok_v)
     infid_C_saleh = np.array([v if v is not None else np.nan for v in infid_C_saleh])
     infid_C_volt = np.array([v if v is not None else np.nan for v in infid_C_volt])

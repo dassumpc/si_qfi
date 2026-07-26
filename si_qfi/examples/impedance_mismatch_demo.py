@@ -8,8 +8,9 @@ and the qubit actually cost gate fidelity, via reflections?
 Hypothesis under test (as posed): degradation should only show up when
 BOTH (a) the impedance is far from 50 ohm AND (b) the propagation delay
 between the mismatched points is long enough to matter relative to the
-pulse length. Verified below: correct, and the crossover is sharp and
-well-characterized -- see THE FINDING.
+pulse length. Confirmed on a coarse (whole-nanosecond) delay grid -- but
+that grid turns out to hide a much larger, sub-carrier-period-sensitive
+effect entirely. See THE FINDING below, and Panel D in particular.
 
 New schematic for this investigation: tests/test_schematic_impedance_mismatch.si
 -- based on test_schematic_basic.si (lossless, single amplifier), but with
@@ -40,50 +41,72 @@ parameter -- see its docstring for the exact contract (applied once,
 before any transfer function is extracted, since extraction is cached per
 SI app instance).
 
-A real numerical trap hit and fixed while building this: SI's frequency-
-domain sweep (CalculationProperties EndFrequency/FrequencyPoints) has a
-DISCRETE frequency grid with spacing df = EndFrequency/FrequencyPoints,
-and representing a pure delay via that discrete grid is only unambiguous
-up to a MAXIMUM delay of 1/df (beyond that, a delay T and T + n/df are
-numerically indistinguishable at the sampled frequencies -- confirmed
-directly: with the original df=10MHz [FrequencyPoints=2000 over 20GHz],
-Tprop=100ns and Tprop=200ns produced IDENTICAL sampled H(f), silently
-aliasing). Fixed by choosing EndFrequency/FrequencyPoints for THIS
-schematic to give df=1.75MHz (max unambiguous delay ~570ns, comfortably
-past the largest Tprop swept below) -- and, since this investigation
-never needs real_axis mode (reflections are a purely linear phenomenon,
-already established mode-independent for linear effects in
-bandwidth_dispersion_fidelity_demo.py's Investigation 4), EndFrequency was
-also dropped from 20GHz to 7GHz (only needs to comfortably cover the
-5GHz carrier + pulse bandwidth) to keep the per-point SI solve fast
-enough for a real parameter sweep (~2-5s/point instead of ~20s/point at
-the original resolution/range).
+A real numerical trap, load-bearing for this whole investigation: SI's
+frequency-domain sweep (CalculationProperties EndFrequency/FrequencyPoints)
+has a DISCRETE frequency grid with spacing df = EndFrequency/FrequencyPoints,
+and the real-axis impulse response derived from it (an IFFT) is only valid
+up to a MAXIMUM time window of 1/df -- energy arriving later than that wraps
+around and lands on top of whatever's near the start of the window instead.
+A severe mismatch's reflection ladder (successive round-trip bounces,
+amplitude decaying by Gamma^2 per bounce) can take MANY round trips --
+several microseconds, for the Gamma~0.7 case tested here -- to actually die
+out, not just one. THIS schematic's EndFrequency=7GHz/FrequencyPoints=32000
+gives df=218.75kHz, i.e. a 1/df~4.57us unambiguous window -- comfortably
+past every bounce that matters for the Tprop range swept below (max 100ns
+one-way here). EndFrequency itself is kept at 7GHz rather than SI's usual
+20GHz (only needs to comfortably cover the 5GHz carrier + pulse bandwidth,
+and reflections are a purely linear phenomenon, already established
+mode-independent for linear effects in bandwidth_dispersion_fidelity_demo.
+py's Investigation 4, so real_axis mode's wider sweep is never needed here)
+to keep the per-point SI solve fast enough for a real parameter sweep.
 
-THE FINDING:
+THE FINDING (Panels A-C -- coarse, whole-nanosecond Tprop grid):
   - At Zmismatch=50 (Gamma=0) EXACTLY, infidelity stays at the numerical
     floor (~1e-7) at ANY delay, including very long ones -- no reflection
     coefficient, no reflection, full stop, regardless of timing.
   - At a SHORT delay (round-trip 2*Tprop << pulse duration), infidelity
-    stays at the numerical floor (~1e-7 to 1e-8) EVEN AT THE MOST SEVERE
-    impedance mismatch tested (300 ohm, Gamma=0.71) -- confirming the
-    "delay must matter too" half of the hypothesis directly: a mismatch
-    with nowhere for its reflection to meaningfully separate from the
-    forward wave in time does essentially nothing to gate fidelity.
-  - At a LONG delay, infidelity grows smoothly and strongly with the
-    reflection coefficient Gamma = |Z-50|/|Z+50| (confirmed symmetric in Z
-    around 50 ohm -- Z=25 and Z=100, both Gamma=0.333, give IDENTICAL
-    infidelity, as expected since the physics only depends on |Gamma|).
+    stays at the numerical floor EVEN AT THE MOST SEVERE impedance
+    mismatch tested (300 ohm, Gamma=0.71) -- confirming the "delay must
+    matter too" half of the hypothesis directly: a mismatch with nowhere
+    for its reflection to meaningfully separate from the forward wave in
+    time does essentially nothing to gate fidelity.
+  - At a LONG delay, infidelity does grow with the reflection coefficient
+    Gamma = |Z-50|/|Z+50| (confirmed symmetric in Z around 50 ohm -- Z=25
+    and Z=100, both Gamma=0.333, give IDENTICAL infidelity, as expected
+    since the physics only depends on |Gamma|) and with delay itself, but
+    STAYS MODEST (parts in 1e-6 to 1e-5 across the whole range tested).
   - Sweeping delay at FIXED severe mismatch (Gamma=0.5): infidelity rises
-    from the numerical floor to catastrophic (>50%) over roughly one and a
-    half decades of round-trip-delay/pulse-duration ratio -- NOT a hard
-    cliff like the pure-AM-AM achievability wall from the nonlinearity
-    investigations, but a smooth, continuous, and eventually very steep
-    transition. The crossover from "clearly negligible" to "clearly
-    significant" sits close to round-trip delay (2*Tprop) ~ pulse
-    duration -- i.e. the user's original framing holds up almost exactly
-    once "propagation delay" is read as the ROUND-TRIP time (there and
-    back), which is the physically meaningful quantity for a reflection
-    (a one-way-only reading would put the crossover a factor of 2 later).
+    smoothly (not a hard cliff) with round-trip-delay/pulse-duration ratio.
+
+WHY THAT PICTURE IS INCOMPLETE, AND WHAT PANEL D SHOWS INSTEAD:
+Every Tprop value in Panels A-C above (and in every regression test) is a
+whole number of nanoseconds. That's not a neutral choice: the carrier is
+exactly 5GHz, so a whole-nanosecond delay is ALWAYS an exact integer number
+of carrier cycles -- the reflected echo's carrier phase on arrival is
+2*pi*5GHz*Tprop, which is therefore ALWAYS 0 (mod 2*pi) at every point
+Panels A-C sample. Resolving Tprop at the sub-carrier-period scale (the
+carrier period is 1/5GHz = 0.2ns) reveals what that coarse grid structurally
+cannot see: infidelity swings from the numerical floor up to order-1 (>50%
+observed) within picoseconds of Tprop, periodic with the 0.2ns carrier
+period -- Panels A-C were, by construction, sampling only the safest phase
+at every single point.
+
+Is this a miscalibration artifact, or genuine distortion? Tested directly
+(see complex_calibrated_infidelity_at()): even a STRONGER calibration that
+launches with the exact complex (amplitude AND phase) scale needed to hit
+the target total rotation area exactly -- verified to land on it to machine
+precision -- does NOT fix it. Infidelity stays comparably large. This proves
+it isn't "wrong total area" (which a 2-parameter calibration would cure);
+it's that the reflected echo, at comparable amplitude to the direct pulse
+and overlapping its tail, makes the INSTANTANEOUS drive axis wobble between
+X and Y during the overlap -- no single global rescale of a fixed pulse
+shape (real or complex) can undo a time-dependent axis wobble, only correct
+its net integrated total. Practically: any calibration no more sophisticated
+than picking a launch amplitude (or amplitude+phase) -- which is what real
+setups typically do -- cannot correct this, and its severity depends on
+cable length at the sub-picosecond scale, which real setups do not control.
+Panels A-C's optimistic numbers hold only at the specific (lucky) delays
+tested, not as a general statement about impedance mismatch.
 
 Run: python examples/impedance_mismatch_demo.py
 Requires: SignalIntegrity, QuTiP, matplotlib.
@@ -97,8 +120,8 @@ import numpy as np
 import qutip
 
 from si_qfi.schematic import loader as si_loader
-from si_qfi.simulation import engine
-from si_qfi.source.waveform import SourceWaveform, build_gaussian_envelope
+from si_qfi.source.waveform import build_gaussian_envelope, source_from_envelope_array
+from si_qfi.simulation import engine as _engine
 from si_qfi import quantum
 
 SCHEMATIC_PATH = (Path(__file__).parent.parent / "tests" / "test_schematic_impedance_mismatch.si").resolve()
@@ -110,39 +133,65 @@ SIGMA_S = DURATION_S / 6
 FS_ENVELOPE = 8e9
 
 
-def _source_from_shape(shape: np.ndarray, fs: float, carrier_ghz: float) -> SourceWaveform:
-    from SignalIntegrity.Lib.TimeDomain.Waveform.Waveform import Waveform
-    from SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor import TimeDescriptor
-
-    n = len(shape)
-    envelope = Waveform(TimeDescriptor(0.0, n, fs), list(shape.astype(complex)))
-    return SourceWaveform(carrier_freq_ghz=carrier_ghz, envelope=envelope)
-
-
 def infidelity_at(zmismatch: float, tprop_s: float, qmodel, mode="complex_baseband") -> float:
     """
-    Self-calibrated pi-pulse infidelity for a given (Zmismatch, Tprop)
-    pair. No nonlinearity anywhere -- this is a purely linear reflection
-    effect. A single reference run + exact rescale suffices (no NL node
-    -> the amplitude->theta map is exactly proportional, same as
-    bandwidth_dispersion_fidelity_demo.py).
+    tuneup_amplitude()-calibrated pi-pulse infidelity for a given
+    (Zmismatch, Tprop) pair. No nonlinearity anywhere -- this is a purely
+    linear reflection effect, so tuneup_amplitude()'s analytic-guess fast
+    path (one reference run + exact rescale) handles every point here in 2
+    engine.run() calls, same cost as the hand-rolled version this replaces.
     """
     schematic = si_loader.load_schematic(
         SCHEMATIC_PATH, variables={"Zmismatch": zmismatch, "Tprop": tprop_s},
     )
     ref_shape = build_gaussian_envelope(DURATION_S, SIGMA_S, FS_ENVELOPE, amp=1.0)
-    source_ref = _source_from_shape(ref_shape, FS_ENVELOPE, CARRIER_GHZ)
-    result_ref = engine.run(schematic, source_ref, nonlinear=None, noise=None, n_realizations=1, mode=mode)
-    v = np.asarray(result_ref.v_nl_qubit)
-    t = np.arange(len(v)) / result_ref.fs
-    theta_ref = float(ETA * np.trapz(np.real(v), t))
-    scale = np.pi / theta_ref
+    tuned = quantum.tuneup_amplitude(
+        schematic, ref_shape, FS_ENVELOPE, CARRIER_GHZ,
+        qmodel, coupling_strength_per_volt=ETA, ideal_gate="X", mode=mode,
+    )
+    return 1.0 - tuned.fidelity.noise_free.F_avg
 
-    cal_shape = ref_shape * scale
-    source_cal = _source_from_shape(cal_shape, FS_ENVELOPE, CARRIER_GHZ)
-    result_cal = engine.run(schematic, source_cal, nonlinear=None, noise=None, n_realizations=1, mode=mode)
-    fid = quantum.gate_fidelity(result_cal, qmodel, coupling_strength_per_volt=ETA, ideal_gate="X")
-    return 1.0 - fid.F_avg
+
+def complex_calibrated_infidelity_at(zmismatch: float, tprop_s: float, qmodel) -> float:
+    """
+    A DELIBERATELY stronger calibration than infidelity_at()/
+    tuneup_amplitude(): instead of rescaling the reference pulse by a single
+    REAL amplitude, rescale it by a COMPLEX number (amplitude AND phase),
+    chosen so the TOTAL (I-quadrature + i*Q-quadrature) integrated area at
+    the qubit lands exactly on the target (pi, 0) -- i.e. this corrects not
+    just "wrong overall amplitude" but also "wrong overall launch phase",
+    which infidelity_at() cannot (its calibration only ever targets the
+    real/X-quadrature area, see tuneup_amplitude()'s own docstring).
+
+    This exists to answer a specific question directly rather than by
+    argument: is the extreme delay-phase sensitivity seen at sub-carrier-
+    period Tprop resolution (see the fine sweep in main()) just a
+    miscalibration artifact that a better calibration would erase, or is it
+    genuine waveform distortion? If it were the former, this function would
+    recover near-unit fidelity everywhere infidelity_at() does not. It does
+    not (confirmed directly, see main()'s printed comparison) -- proving the
+    effect is real distortion (the echo overlaps the drive's own tail at
+    comparable amplitude, so the instantaneous drive axis wobbles between X
+    and Y during the overlap; no single global rescale of a fixed pulse
+    shape, real or complex, can undo a time-dependent axis wobble, only its
+    net integrated total).
+    """
+    schematic = si_loader.load_schematic(
+        SCHEMATIC_PATH, variables={"Zmismatch": zmismatch, "Tprop": tprop_s},
+    )
+    ref_shape = build_gaussian_envelope(DURATION_S, SIGMA_S, FS_ENVELOPE, amp=1.0)
+    src_ref = source_from_envelope_array(ref_shape, FS_ENVELOPE, CARRIER_GHZ)
+    result_ref = _engine.run(schematic, src_ref, nonlinear=None, noise=None, n_realizations=1, mode="complex_baseband")
+    v_ref = np.asarray(result_ref.v_nl_qubit)
+    t_ref = np.arange(len(v_ref)) / result_ref.fs
+    area_ref = ETA * np.trapz(v_ref, t_ref)   # complex: theta_x_ref + i*theta_y_ref
+
+    complex_scale = np.pi / area_ref   # exact for a linear channel -- no search needed
+    source_shape = complex_scale * ref_shape.astype(complex)
+    src = source_from_envelope_array(source_shape, FS_ENVELOPE, CARRIER_GHZ)
+    result = _engine.run(schematic, src, nonlinear=None, noise=None, n_realizations=1, mode="complex_baseband")
+    fid = quantum.gate_fidelity(result, qmodel, coupling_strength_per_volt=ETA, ideal_gate="X")
+    return 1.0 - fid.noise_free.F_avg
 
 
 def reflection_coefficient(z, z0=50.0):
@@ -187,6 +236,46 @@ def main():
         for j, z in enumerate(z_grid):
             infid_c[i, j] = infidelity_at(z, t_ns * 1e-9, qmodel)
 
+    # ------------------------------------------------------------------
+    # Panel D: EVERY Tprop used in Panels A-C above (and in the regression
+    # tests) is a whole number of nanoseconds -- and because the carrier is
+    # exactly 5GHz, a whole-nanosecond delay is ALWAYS an exact integer
+    # number of carrier cycles. That's not a neutral choice of sweep grid:
+    # the reflected echo's carrier phase on arrival is 2*pi*carrier*Tprop,
+    # so every whole-ns Tprop lands EXACTLY on a phase-zero point where the
+    # echo's contribution is purely real (X-axis only, no Y leakage) --
+    # coincidentally the SAFEST possible point. This panel resolves Tprop at
+    # the sub-carrier-period scale (carrier period = 1/5GHz = 0.2ns) to show
+    # what Panels A-C's coarse, whole-ns grid never samples: infidelity
+    # swinging from the numerical floor up to order-1 within a few
+    # picoseconds of Tprop, periodic with the 0.2ns carrier period.
+    #
+    # Two curves are computed at every point to distinguish MISCALIBRATION
+    # from genuine DISTORTION:
+    #   - "real-scale calibration" = infidelity_at(), i.e. what every other
+    #     panel and every regression test uses: tuneup_amplitude() picks a
+    #     single REAL amplitude so the total X-quadrature area hits pi.
+    #   - "complex-scale calibration" = complex_calibrated_infidelity_at():
+    #     a strictly STRONGER calibration allowed to also pick the launch
+    #     PHASE, so the total (X, Y) area lands exactly on (pi, 0) -- not
+    #     just close, exact, verified directly (see that function's
+    #     docstring). If the sub-carrier-period sensitivity were just a
+    #     calibration gap, this curve would sit at the floor everywhere.
+    #     It does not -- it tracks the real-scale curve within a factor of
+    #     ~2 almost everywhere, proving this is genuine waveform distortion
+    #     (the echo overlaps the drive's own tail at comparable amplitude,
+    #     so the instantaneous drive axis wobbles between X and Y during the
+    #     overlap -- no single global rescale, real or complex, of a FIXED
+    #     pulse shape can undo a time-dependent axis wobble, only correct
+    #     its net integrated total).
+    print("Panel D: fine (sub-carrier-period) Tprop sweep at Gamma=0.71 "
+          "-- real-scale vs complex-scale calibration...")
+    tprop_d_base_ns = 100.0
+    offsets_ns = np.linspace(0.0, 0.2, 11)   # exactly one carrier period (1/5GHz)
+    tprops_d_ns = tprop_d_base_ns + offsets_ns
+    infid_d_real = np.array([infidelity_at(300.0, t * 1e-9, qmodel) for t in tprops_d_ns])
+    infid_d_complex = np.array([complex_calibrated_infidelity_at(300.0, t * 1e-9, qmodel) for t in tprops_d_ns])
+
     print()
     print("=== Summary ===")
     print(f"Panel A: infidelity spans {infid_a.min():.2e} to {infid_a.max():.2e} "
@@ -196,12 +285,17 @@ def main():
           f"across Gamma=0 to Gamma={gammas.max():.2f}")
     print(f"Panel B (long delay, {tprop_long_s*1e9:.0f}ns): "
           f"infidelity spans [{infid_b_long.min():.2e}, {infid_b_long.max():.2e}] over the same Gamma range")
+    print(f"Panel D: over ONE carrier period ({tprop_d_base_ns:.1f}ns to {tprops_d_ns[-1]:.1f}ns, Gamma=0.71), "
+          f"real-scale-calibrated infidelity spans {infid_d_real.min():.2e} to {infid_d_real.max():.2e}; "
+          f"complex-scale (exact total-area) calibration spans {infid_d_complex.min():.2e} to "
+          f"{infid_d_complex.max():.2e} -- fixing the total launch amplitude+phase does NOT fix this, "
+          f"confirming genuine waveform distortion, not miscalibration.")
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(13, 10))
     floor = 1e-8
 
     ax1.loglog(ratio_a, np.maximum(infid_a, floor), "o-", color="C0")
@@ -242,6 +336,19 @@ def main():
     ax3.set_title("C: Combined picture\nlog10(infidelity)")
     cbar = fig.colorbar(im, ax=ax3)
     cbar.set_label("log10(1 - F_avg)")
+
+    ax4.semilogy(offsets_ns, np.maximum(infid_d_real, floor), "o-", color="C1",
+                 label="real-scale calibration (what A-C/tests use)")
+    ax4.semilogy(offsets_ns, np.maximum(infid_d_complex, floor), "s--", color="C4",
+                 label="complex-scale calibration (exact total area)")
+    ax4.axvline(0.0, color="gray", ls=":", lw=1)
+    ax4.axvline(0.1, color="gray", ls=":", lw=1, label="half carrier period")
+    ax4.axvline(0.2, color="gray", ls=":", lw=1)
+    ax4.set_xlabel(f"Tprop - {tprop_d_base_ns:.0f}ns  (offset, ns -- one full 5GHz carrier period)")
+    ax4.set_ylabel("Infidelity to X (1 - F_avg)")
+    ax4.set_title("D: Panels A-C's whole-ns Tprop grid\nalways lands on the safe points --\nthis is what's between them (Gamma=0.71)")
+    ax4.legend(fontsize=7)
+    ax4.grid(alpha=0.3, which="both")
 
     plt.tight_layout()
     out_path = Path(__file__).parent / "impedance_mismatch_demo.png"

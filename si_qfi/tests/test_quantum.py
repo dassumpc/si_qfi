@@ -8,7 +8,7 @@ Requires QuTiP; skipped entirely if it isn't installed.
 Verified once (2026-07-11, QuTiP 5.0.4) and relied on throughout this file:
   - qt.propagator(H, T, c_ops=, tlist=) returns a plain unitary when
     c_ops=() (closed system) and a superoperator when c_ops is non-empty
-    (open system, Lindblad) -- see quantum/__init__.py's module docstring.
+    (open system, Lindblad) -- see quantum/fidelity.py's module docstring.
   - qt.average_gate_fidelity(oper, target) accepts either against a plain
     unitary target, and is insensitive to oper's global phase.
 
@@ -20,7 +20,7 @@ no intrinsic timescale to size steps against), returning U_actual ~
 identity -- i.e. F~1/3 to an X target -- with no error or warning. A clean
 analytic array didn't reproduce it; only the real, numerically-noisy
 FFT/convolution-derived waveform did. See the "CRITICAL" comment at
-gate_fidelity()'s solver_options in quantum/__init__.py. If these tests
+gate_fidelity()'s solver_options in quantum/fidelity.py. If these tests
 ever start failing with F close to 1/3 (not close to 1), that fix likely
 regressed.
 
@@ -38,6 +38,14 @@ This works identically for complex_baseband and real_axis modes, and
 doesn't hardcode test_schematic_basic.si's own gain (2.5, see
 test_schematic_hookup.py) anywhere -- so it stays correct even if the
 fixture schematic's gain ever changes.
+
+FidelityResult shape (2026-07-13): gate_fidelity() splits its result into
+`.noise_free` (a SingleFidelity -- always populated, one solve on
+result.v_nl_qubit) and `.noise` (a NoiseEnsembleFidelity -- only populated
+when the SimulationResult passed in had real noise configured, i.e.
+result.noise_enabled). Every engine.run() call in this file uses
+noise=None, so `.noise` is always None here -- every fidelity read below
+goes through `.noise_free`.
 """
 from __future__ import annotations
 
@@ -80,8 +88,9 @@ def _qubit_model_2lvl():
     on-resonance with the carrier -- no detuning term). drive_op is left
     at QubitModel's own default (destroy(2)+destroy(2).dag(), i.e. sigmax),
     which happens to be exactly what build_hamiltonian() itself hardcodes
-    internally regardless of drive_op (see quantum/__init__.py) -- so this
-    default is the only choice that's actually honored end-to-end today.
+    internally regardless of drive_op (see quantum/hamiltonian.py) -- so
+    this default is the only choice that's actually honored end-to-end
+    today.
     """
     H0 = 0 * qutip.qeye(2)
     return quantum.QubitModel(H0=H0, n_levels=2)
@@ -188,8 +197,8 @@ def test_gate_fidelity_baseband_pi_pulse_near_unity(basic_schematic):
     fid = quantum.gate_fidelity(
         result, qmodel, ideal_gate="X", coupling_strength_per_volt=_ETA,
     )
-    assert fid.F_avg == pytest.approx(1.0, abs=1e-6)
-    assert fid.n_realizations == 1
+    assert fid.noise_free.F_avg == pytest.approx(1.0, abs=1e-6)
+    assert fid.noise is None   # noise=None was passed to engine.run()
 
 
 def test_gate_fidelity_realaxis_pi_pulse_near_unity(basic_schematic):
@@ -207,7 +216,7 @@ def test_gate_fidelity_realaxis_pi_pulse_near_unity(basic_schematic):
         result, qmodel, ideal_gate="X", coupling_strength_per_volt=_ETA,
         lpf_cutoff_hz=_LPF_CUTOFF_HZ,
     )
-    assert fid.F_avg == pytest.approx(1.0, abs=1e-3)
+    assert fid.noise_free.F_avg == pytest.approx(1.0, abs=1e-3)
 
 
 def test_gate_fidelity_baseband_and_realaxis_agree(basic_schematic):
@@ -231,9 +240,9 @@ def test_gate_fidelity_baseband_and_realaxis_agree(basic_schematic):
         result_ra, qmodel, ideal_gate="X/2", coupling_strength_per_volt=_ETA,
         lpf_cutoff_hz=_LPF_CUTOFF_HZ,
     )
-    assert fid_bb.F_avg == pytest.approx(1.0, abs=1e-6)
-    assert fid_ra.F_avg == pytest.approx(1.0, abs=1e-3)
-    assert fid_ra.F_avg == pytest.approx(fid_bb.F_avg, abs=1e-3)
+    assert fid_bb.noise_free.F_avg == pytest.approx(1.0, abs=1e-6)
+    assert fid_ra.noise_free.F_avg == pytest.approx(1.0, abs=1e-3)
+    assert fid_ra.noise_free.F_avg == pytest.approx(fid_bb.noise_free.F_avg, abs=1e-3)
 
 
 def test_gate_fidelity_baseband_half_pi_pulse_near_unity(basic_schematic):
@@ -248,8 +257,8 @@ def test_gate_fidelity_baseband_half_pi_pulse_near_unity(basic_schematic):
     fid = quantum.gate_fidelity(
         result, qmodel, ideal_gate="X/2", coupling_strength_per_volt=_ETA,
     )
-    assert fid.F_avg == pytest.approx(1.0, abs=1e-6)
-    assert fid.ideal_gate == "X/2"
+    assert fid.noise_free.F_avg == pytest.approx(1.0, abs=1e-6)
+    assert fid.noise_free.ideal_gate == "X/2"
 
 
 def test_gate_fidelity_realaxis_half_pi_pulse_near_unity(basic_schematic):
@@ -260,7 +269,7 @@ def test_gate_fidelity_realaxis_half_pi_pulse_near_unity(basic_schematic):
         result, qmodel, ideal_gate="X/2", coupling_strength_per_volt=_ETA,
         lpf_cutoff_hz=_LPF_CUTOFF_HZ,
     )
-    assert fid.F_avg == pytest.approx(1.0, abs=1e-3)
+    assert fid.noise_free.F_avg == pytest.approx(1.0, abs=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -282,34 +291,70 @@ def test_gate_fidelity_with_T1_reduces_fidelity_sensibly(basic_schematic):
         result, qmodel, ideal_gate="X", coupling_strength_per_volt=_ETA,
         T1_us=T1_us,
     )
-    assert fid_open.F_avg < fid_closed.F_avg
+    assert fid_open.noise_free.F_avg < fid_closed.noise_free.F_avg
     # T_gate/T1 = 100ns/50us = 0.002 -- a small, bounded infidelity is
     # expected (order 1e-3), not a collapse to ~0.5 (maximally mixed) or a
     # value outside [0, 1].
-    assert 0.0 <= fid_open.F_avg <= 1.0
-    assert fid_open.F_avg == pytest.approx(1.0, abs=5e-3)
-    assert fid_open.F_avg == pytest.approx(0.99868, abs=2e-4)
+    assert 0.0 <= fid_open.noise_free.F_avg <= 1.0
+    assert fid_open.noise_free.F_avg == pytest.approx(1.0, abs=5e-3)
+    assert fid_open.noise_free.F_avg == pytest.approx(0.99868, abs=2e-4)
 
 
 # ---------------------------------------------------------------------------
-# Raw propagator / state-fidelity API (2026-07-11): FidelityResult.propagators
-# is populated at zero extra solve cost (the channel gate_fidelity() already
-# has to compute to get F_avg), and gate_fidelity() can now compare against
-# a target_state (a ket or density matrix -- state fidelity, qt.fidelity())
-# instead of, or alongside, ideal_gate (a gate name/matrix -- channel
-# fidelity, qt.average_gate_fidelity()).
+# State vs. gate fidelity: genuinely different metrics, not two views of
+# the same number (2026-07-13, added after a direct review question).
+# gate fidelity averages the channel's behavior over ALL input states (the
+# full Bloch sphere); state fidelity only checks ONE specific input->output
+# pair. They coincide near a perfect gate (both ~1, see the T1 test above
+# and the pi-pulse tests, which only ever check gate fidelity at F~1), but
+# diverge substantially away from that -- confirmed directly under heavy
+# PURE dephasing (T2 only, no extra T1): gate F_avg~0.649 vs.
+# state_F_avg~0.929, because pure dephasing barely touches a
+# computational-basis population transfer (|0> -> |1>) but heavily damages
+# the Bloch-sphere-averaged gate metric (which is sensitive to what
+# dephasing does to superposition inputs, e.g. |0>+|1>). This is a
+# permanent record of that divergence so nobody "fixes" the apparent
+# inconsistency between these two metrics later by mistake.
 # ---------------------------------------------------------------------------
 
-def test_gate_fidelity_populates_propagators(basic_schematic):
-    """propagators is always populated, one qt.Qobj per realization, and is
-    a plain unitary ('oper') for a closed-system (no T1/T2) run."""
+def test_gate_and_state_fidelity_diverge_under_pure_dephasing(basic_schematic):
+    result = _run_calibrated_pi_pulse(basic_schematic, "complex_baseband")
+    qmodel = _qubit_model_2lvl()
+    target = qutip.basis(2, 1)   # |1>
+
+    # T1_us effectively off (very long), T2_us short -> pure dephasing,
+    # negligible relaxation.
+    fid = quantum.gate_fidelity(
+        result, qmodel, coupling_strength_per_volt=_ETA,
+        ideal_gate="X", target_state=target,
+        T1_us=1000.0, T2_us=0.05,
+    )
+    gap = fid.noise_free.F_avg - fid.noise_free.state_F_avg
+    # Measured directly: gate F_avg~0.649, state_F_avg~0.929 (gap ~0.28).
+    # state fidelity is the LARGER of the two here -- assert the gap in
+    # that direction and with enough margin to not be noise-sensitive.
+    assert gap < -0.15
+
+
+# ---------------------------------------------------------------------------
+# Raw propagator / state-fidelity API (2026-07-11): FidelityResult.
+# noise_free.propagator is populated at zero extra solve cost (the channel
+# gate_fidelity() already has to compute to get F_avg), and gate_fidelity()
+# can compare against a target_state (a ket or density matrix -- state
+# fidelity, qt.fidelity()) instead of, or alongside, ideal_gate (a gate
+# name/matrix -- channel fidelity, qt.average_gate_fidelity()).
+# ---------------------------------------------------------------------------
+
+def test_gate_fidelity_populates_propagator(basic_schematic):
+    """noise_free.propagator is always populated, a single qt.Qobj that's a
+    plain unitary ('oper') for a closed-system (no T1/T2) run."""
     result = _run_calibrated_pi_pulse(basic_schematic, "complex_baseband")
     qmodel = _qubit_model_2lvl()
     fid = quantum.gate_fidelity(
         result, qmodel, ideal_gate="X", coupling_strength_per_volt=_ETA,
     )
-    assert len(fid.propagators) == fid.n_realizations == 1
-    U = fid.propagators[0]
+    U = fid.noise_free.propagator
+    assert U is not None
     assert U.type == "oper"
     # Not exactly qt.isunitary (that check's tolerance is tighter than the
     # ~1e-7 numerical floor already characterized for this pulse/sample
@@ -319,20 +364,20 @@ def test_gate_fidelity_populates_propagators(basic_schematic):
 
 
 def test_gate_fidelity_propagator_is_superoperator_with_T1(basic_schematic):
-    """Same, but with T1_us given -- propagators should hold a superoperator
-    (open-system channel) instead of a plain unitary."""
+    """Same, but with T1_us given -- the propagator should be a
+    superoperator (open-system channel) instead of a plain unitary."""
     result = _run_calibrated_pi_pulse(basic_schematic, "complex_baseband")
     qmodel = _qubit_model_2lvl()
     fid = quantum.gate_fidelity(
         result, qmodel, ideal_gate="X", coupling_strength_per_volt=_ETA,
         T1_us=50.0,
     )
-    assert fid.propagators[0].type == "super"
+    assert fid.noise_free.propagator.type == "super"
 
 
-def test_final_states_from_propagators_matches_calibrated_pi_pulse(basic_schematic):
+def test_final_state_from_propagator_matches_calibrated_pi_pulse(basic_schematic):
     """
-    FidelityResult.final_states() applies the stored propagator to the
+    SingleFidelity.final_state() applies the stored propagator to the
     default initial state (|0>) and should reproduce the same physics as
     the calibrated pi-pulse: starting in |0>, a pi-pulse about the I axis
     should leave the qubit in |1> (population ~1, off-diagonal ~0) --
@@ -344,7 +389,7 @@ def test_final_states_from_propagators_matches_calibrated_pi_pulse(basic_schemat
     fid = quantum.gate_fidelity(
         result, qmodel, ideal_gate="X", coupling_strength_per_volt=_ETA,
     )
-    rho_final = fid.final_states()[0]
+    rho_final = fid.noise_free.final_state()
     assert rho_final.type == "oper"
     assert rho_final.tr() == pytest.approx(1.0, abs=1e-4)          # valid density matrix
     assert rho_final.full()[1, 1].real == pytest.approx(1.0, abs=1e-4)   # population in |1>
@@ -355,9 +400,9 @@ def test_gate_fidelity_target_state_only(basic_schematic):
     """
     target_state (no ideal_gate) computes STATE fidelity instead of GATE
     fidelity: a calibrated pi-pulse starting from the default initial state
-    |0> should land very close to |1>, so state_fidelities/state_F_avg
-    should be near 1 against target_state=|1>. fidelities/F_avg/ideal_gate
-    should be left unset (None) since no gate comparison was requested.
+    |0> should land very close to |1>, so state_F_avg should be near 1
+    against target_state=|1>. F_avg/ideal_gate should be left unset (None)
+    since no gate comparison was requested.
     """
     result = _run_calibrated_pi_pulse(basic_schematic, "complex_baseband")
     qmodel = _qubit_model_2lvl()
@@ -366,11 +411,10 @@ def test_gate_fidelity_target_state_only(basic_schematic):
     fid = quantum.gate_fidelity(
         result, qmodel, coupling_strength_per_volt=_ETA, target_state=target,
     )
-    assert fid.fidelities is None
-    assert fid.F_avg is None
-    assert fid.ideal_gate is None
-    assert fid.state_F_avg == pytest.approx(1.0, abs=1e-4)
-    assert len(fid.propagators) == 1   # still populated regardless
+    assert fid.noise_free.F_avg is None
+    assert fid.noise_free.ideal_gate is None
+    assert fid.noise_free.state_F_avg == pytest.approx(1.0, abs=1e-4)
+    assert fid.noise_free.propagator is not None   # still populated regardless
 
 
 def test_gate_fidelity_ideal_gate_and_target_state_together(basic_schematic):
@@ -384,8 +428,8 @@ def test_gate_fidelity_ideal_gate_and_target_state_together(basic_schematic):
         result, qmodel, coupling_strength_per_volt=_ETA,
         ideal_gate="X", target_state=target,
     )
-    assert fid.F_avg == pytest.approx(1.0, abs=1e-6)
-    assert fid.state_F_avg == pytest.approx(1.0, abs=1e-4)
+    assert fid.noise_free.F_avg == pytest.approx(1.0, abs=1e-6)
+    assert fid.noise_free.state_F_avg == pytest.approx(1.0, abs=1e-4)
 
 
 def test_gate_fidelity_accepts_custom_qobj_ideal_gate(basic_schematic):
@@ -402,7 +446,7 @@ def test_gate_fidelity_accepts_custom_qobj_ideal_gate(basic_schematic):
     fid_custom = quantum.gate_fidelity(
         result, qmodel, ideal_gate=X_matrix, coupling_strength_per_volt=_ETA,
     )
-    assert fid_custom.F_avg == pytest.approx(fid_named.F_avg, abs=1e-9)
+    assert fid_custom.noise_free.F_avg == pytest.approx(fid_named.noise_free.F_avg, abs=1e-9)
 
 
 def test_gate_fidelity_requires_ideal_gate_or_target_state(basic_schematic):

@@ -81,8 +81,7 @@ import numpy as np
 import qutip
 
 from si_qfi.schematic import loader as si_loader
-from si_qfi.simulation import engine
-from si_qfi.source.waveform import SourceWaveform, build_gaussian_envelope
+from si_qfi.source.waveform import build_gaussian_envelope
 from si_qfi import quantum
 
 SCHEMATIC_PATH = (Path(__file__).parent.parent / "tests" / "test_schematic_basic.si").resolve()
@@ -104,41 +103,32 @@ T1_US_B = 30.0
 T2_US_VALUES_B = np.array([60.0, 30.0, 15.0, 7.5, 3.75, 1.875, 0.9375])   # 60us = 2*T1 (T1-limited)
 
 
-def _source_from_shape(shape: np.ndarray, fs: float, carrier_ghz: float) -> SourceWaveform:
-    from SignalIntegrity.Lib.TimeDomain.Waveform.Waveform import Waveform
-    from SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor import TimeDescriptor
-
-    n = len(shape)
-    envelope = Waveform(TimeDescriptor(0.0, n, fs), list(shape.astype(complex)))
-    return SourceWaveform(carrier_freq_ghz=carrier_ghz, envelope=envelope)
-
-
 def infidelity_and_true_gate_time(schematic, duration_s: float, qmodel, T1_us=None, T2_us=None):
     """Returns (infidelity, T_gate_true) -- T_gate_true is the ACTUAL
     simulated propagation time (array length / fs), which is longer than
     `duration_s` by this schematic's own convolution tail (see module
-    docstring) and is the value that actually matters for T1_us/T2_us."""
+    docstring) and is the value that actually matters for T1_us/T2_us.
+
+    Calibration (via tuneup_amplitude()) is deliberately done WITHOUT
+    T1_us/T2_us -- tuneup_amplitude() only ever optimizes the noise-free
+    (closed-system) fidelity, matching this demo's own original approach
+    of calibrating on the clean/classical pulse and only applying
+    decoherence in a separate final gate_fidelity() call at the tuned
+    scale.
+    """
     sigma_s = duration_s / 6
     ref_shape = build_gaussian_envelope(duration_s, sigma_s, FS_ENVELOPE, amp=1.0)
-    source_ref = _source_from_shape(ref_shape, FS_ENVELOPE, CARRIER_GHZ)
-    result_ref = engine.run(
-        schematic, source_ref, nonlinear=None, noise=None, n_realizations=1, mode="complex_baseband",
+    tuned = quantum.tuneup_amplitude(
+        schematic, ref_shape, FS_ENVELOPE, CARRIER_GHZ,
+        qmodel, coupling_strength_per_volt=ETA, ideal_gate="X", mode="complex_baseband",
     )
-    v = np.asarray(result_ref.v_nl_qubit)
-    t = np.arange(len(v)) / result_ref.fs
-    theta_ref = float(ETA * np.trapz(np.real(v), t))
-    cal_shape = ref_shape * (np.pi / theta_ref)
-
-    source = _source_from_shape(cal_shape, FS_ENVELOPE, CARRIER_GHZ)
-    result = engine.run(
-        schematic, source, nonlinear=None, noise=None, n_realizations=1, mode="complex_baseband",
-    )
+    result = tuned.result
     T_gate_true = (len(result.v_qubit_ensemble[0]) - 1) / result.fs
     fid = quantum.gate_fidelity(
         result, qmodel, ideal_gate="X", coupling_strength_per_volt=ETA,
         T1_us=T1_us, T2_us=T2_us,
     )
-    return 1.0 - fid.F_avg, T_gate_true
+    return 1.0 - fid.noise_free.F_avg, T_gate_true
 
 
 def main():

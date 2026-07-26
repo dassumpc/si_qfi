@@ -82,8 +82,7 @@ import numpy as np
 import qutip
 
 from si_qfi.schematic import loader as si_loader
-from si_qfi.simulation import engine
-from si_qfi.source.waveform import SourceWaveform, build_gaussian_envelope, build_drag_envelope
+from si_qfi.source.waveform import build_gaussian_envelope, build_drag_envelope
 from si_qfi import quantum
 
 SCHEMATIC_PATH = (Path(__file__).parent.parent / "tests" / "test_schematic_basic.si").resolve()
@@ -113,30 +112,6 @@ def _transmon_rotating_frame_qubit_model(anharmonicity_hz: float, n_levels: int)
     return quantum.QubitModel(H0=H0, n_levels=n_levels)
 
 
-def _source_from_shape(shape: np.ndarray, fs: float, carrier_ghz: float) -> SourceWaveform:
-    from SignalIntegrity.Lib.TimeDomain.Waveform.Waveform import Waveform
-    from SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor import TimeDescriptor
-
-    n = len(shape)
-    envelope = Waveform(TimeDescriptor(0.0, n, fs), list(shape.astype(complex)))
-    return SourceWaveform(carrier_freq_ghz=carrier_ghz, envelope=envelope)
-
-
-def _calibrate_to_pi(schematic, ref_shape: np.ndarray) -> np.ndarray:
-    """One reference run -> exact (linear system, no NL) amplitude scale
-    hitting a pulse area of pi on the I axis. Scaling the whole complex
-    (I+jQ) shape by one real scalar preserves the I/Q ratio DRAG needs to
-    keep canceling leakage after calibration."""
-    source_ref = _source_from_shape(ref_shape, FS_ENVELOPE, CARRIER_GHZ)
-    result_ref = engine.run(
-        schematic, source_ref, nonlinear=None, noise=None, n_realizations=1, mode="complex_baseband",
-    )
-    v = np.asarray(result_ref.v_nl_qubit)
-    t = np.arange(len(v)) / result_ref.fs
-    theta_ref = float(ETA * np.trapz(np.real(v), t))
-    return ref_shape * (np.pi / theta_ref)
-
-
 def run_leakage_case(schematic, duration_s: float, qmodel: quantum.QubitModel, use_drag: bool):
     """
     Returns (state_infidelity, leakage_population): state_infidelity is
@@ -146,6 +121,13 @@ def run_leakage_case(schematic, duration_s: float, qmodel: quantum.QubitModel, u
     n_levels > 2); leakage_population is the final population found outside
     the {|0>,|1>} computational subspace (0.0 for the 2-level model, which
     has no such subspace to leak into).
+
+    Calibration is via tuneup_amplitude(): its target_state|0>-\>|1>
+    pattern detection recognizes this exact target/initial_state pair and
+    uses the same exact classical-pulse-area fast path as the old
+    _calibrate_to_pi() (2 engine.run() calls, no NL here) -- scaling the
+    whole complex (I+jQ) reference shape by one real scalar, which is what
+    DRAG needs to keep its I/Q ratio intact after calibration.
     """
     sigma_s = duration_s / 6
     if use_drag:
@@ -153,21 +135,18 @@ def run_leakage_case(schematic, duration_s: float, qmodel: quantum.QubitModel, u
     else:
         ref_shape = build_gaussian_envelope(duration_s, sigma_s, FS_ENVELOPE, amp=1.0)
 
-    cal_shape = _calibrate_to_pi(schematic, ref_shape)
-    source = _source_from_shape(cal_shape, FS_ENVELOPE, CARRIER_GHZ)
-    result = engine.run(
-        schematic, source, nonlinear=None, noise=None, n_realizations=1, mode="complex_baseband",
-    )
     n = qmodel.n_levels
     target = qutip.basis(n, 1)
     initial = qutip.basis(n, 0)
-    fid = quantum.gate_fidelity(
-        result, qmodel, coupling_strength_per_volt=ETA,
-        target_state=target, initial_state=initial,
+    tuned = quantum.tuneup_amplitude(
+        schematic, ref_shape, FS_ENVELOPE, CARRIER_GHZ,
+        qmodel, coupling_strength_per_volt=ETA,
+        target_state=target, initial_state=initial, mode="complex_baseband",
     )
-    state_infidelity = 1.0 - fid.state_F_avg
+    fid = tuned.fidelity
+    state_infidelity = 1.0 - fid.noise_free.state_F_avg
 
-    rho_final = fid.final_states(initial_state=initial)[0]
+    rho_final = fid.noise_free.final_state(initial_state=initial)
     populations = np.real(rho_final.diag())
     leakage_population = float(np.sum(populations[2:])) if n > 2 else 0.0
 

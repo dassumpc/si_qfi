@@ -33,8 +33,7 @@ qutip = pytest.importorskip("qutip")
 warnings.filterwarnings("ignore", message="SI-QFI: Narrowband ratio")
 
 from si_qfi.schematic import loader as si_loader
-from si_qfi.simulation import engine
-from si_qfi.source.waveform import SourceWaveform, build_gaussian_envelope, build_drag_envelope
+from si_qfi.source.waveform import build_gaussian_envelope, build_drag_envelope
 from si_qfi import quantum
 
 SCHEMATIC_PATH = (Path(__file__).parent / "test_schematic_basic.si").resolve()
@@ -56,41 +55,27 @@ def _qubit_model_2lvl():
     return quantum.QubitModel(H0=0 * qutip.qeye(2), n_levels=2)
 
 
-def _source_from_shape(shape, fs, carrier_ghz):
-    from SignalIntegrity.Lib.TimeDomain.Waveform.Waveform import Waveform
-    from SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor import TimeDescriptor
-
-    n = len(shape)
-    envelope = Waveform(TimeDescriptor(0.0, n, fs), list(shape.astype(complex)))
-    return SourceWaveform(carrier_freq_ghz=carrier_ghz, envelope=envelope)
-
-
 def _run_leakage_case(schematic, duration_s, qmodel, use_drag):
+    """tuneup_amplitude()'s target_state |0>->|1> pattern detection uses
+    the same exact classical-pulse-area fast path as the hand-rolled
+    version this replaces (2 engine.run() calls, no NL here)."""
     sigma_s = duration_s / 6
     if use_drag:
         ref_shape = build_drag_envelope(duration_s, sigma_s, _ANHARMONICITY_MHZ * 1e6, _FS_ENVELOPE, pi_amp=1.0)
     else:
         ref_shape = build_gaussian_envelope(duration_s, sigma_s, _FS_ENVELOPE, amp=1.0)
 
-    source_ref = _source_from_shape(ref_shape, _FS_ENVELOPE, _CARRIER_GHZ)
-    result_ref = engine.run(schematic, source_ref, nonlinear=None, noise=None, n_realizations=1, mode="complex_baseband")
-    v = np.asarray(result_ref.v_nl_qubit)
-    t = np.arange(len(v)) / result_ref.fs
-    theta_ref = float(_ETA * np.trapz(np.real(v), t))
-    cal_shape = ref_shape * (np.pi / theta_ref)
-
-    source = _source_from_shape(cal_shape, _FS_ENVELOPE, _CARRIER_GHZ)
-    result = engine.run(schematic, source, nonlinear=None, noise=None, n_realizations=1, mode="complex_baseband")
-
     n = qmodel.n_levels
     target = qutip.basis(n, 1)
     initial = qutip.basis(n, 0)
-    fid = quantum.gate_fidelity(
-        result, qmodel, coupling_strength_per_volt=_ETA,
-        target_state=target, initial_state=initial,
+    tuned = quantum.tuneup_amplitude(
+        schematic, ref_shape, _FS_ENVELOPE, _CARRIER_GHZ,
+        qmodel, coupling_strength_per_volt=_ETA,
+        target_state=target, initial_state=initial, mode="complex_baseband",
     )
-    state_infidelity = 1.0 - fid.state_F_avg
-    rho_final = fid.final_states(initial_state=initial)[0]
+    fid = tuned.fidelity
+    state_infidelity = 1.0 - fid.noise_free.state_F_avg
+    rho_final = fid.noise_free.final_state(initial_state=initial)
     populations = np.real(rho_final.diag())
     leakage_population = float(np.sum(populations[2:])) if n > 2 else 0.0
     return state_infidelity, leakage_population

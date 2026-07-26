@@ -34,6 +34,21 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
+def source_from_envelope_array(shape: np.ndarray, fs: float, carrier_ghz: float) -> "SourceWaveform":
+    """
+    Build a SourceWaveform directly from a numpy envelope array (as
+    returned by build_gaussian_envelope()/build_drag_envelope() below) --
+    the SI Waveform/TimeDescriptor construction every demo/test in this
+    codebase was hand-duplicating identically.
+    """
+    from SignalIntegrity.Lib.TimeDomain.Waveform.Waveform import Waveform
+    from SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor import TimeDescriptor
+
+    n = len(shape)
+    envelope = Waveform(TimeDescriptor(0.0, n, fs), list(shape.astype(complex)))
+    return SourceWaveform(carrier_freq_ghz=carrier_ghz, envelope=envelope)
+
+
 @dataclass
 class SourceWaveform:
     """

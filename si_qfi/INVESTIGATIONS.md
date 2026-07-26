@@ -315,57 +315,89 @@ transfer function shows the textbook reflection signature (frequency-
 domain ripple) once mismatched, and is symmetric in `|Z-50|` around 50Ω as
 physically required.
 
-**A real numerical trap hit and fixed while building this:** SI's
-frequency sweep has a *discrete* grid (spacing `df = EndFrequency /
-FrequencyPoints`), and representing a pure delay on that grid is only
-unambiguous up to `1/df` — beyond that, a delay `T` and `T + n/df` produce
-*identical* sampled `H(f)`, silently aliasing (confirmed directly: at the
-original `df=10MHz`, `Tprop=100ns` and `Tprop=200ns` gave bit-identical
-results). Fixed by choosing `EndFrequency`/`FrequencyPoints` for this
-schematic to push the unambiguous range past the largest delay swept
-(~570ns headroom), while *also* shrinking `EndFrequency` itself (this
-investigation never needs `real_axis` mode — reflections are a purely
-linear effect, already established mode-independent by Investigation 4 —
-so there's no need for the wide sweep real-axis harmonic tracking would
-require) to keep each point's SI solve fast enough for an actual sweep
-(~20s/point at the original resolution/range → ~2–5s/point after).
+**A methodological requirement worth flagging for anyone extending this:**
+SI's frequency sweep has a *discrete* grid (spacing `df = EndFrequency /
+FrequencyPoints`), and the real-axis impulse response derived from it (an
+IFFT) is only valid up to a time window of `1/df` — energy arriving later
+wraps around and lands on top of the start of the window instead. A severe
+mismatch's reflection ladder (successive round-trip bounces, amplitude
+decaying by `Γ²` per bounce) can take many round trips — several
+microseconds, for `Γ≈0.7` — to actually die out. This schematic's
+`EndFrequency=7GHz`/`FrequencyPoints=32000` gives `df≈218.75kHz`, i.e. a
+`1/df≈4.57µs` unambiguous window, comfortably past every bounce that
+matters for the `Tprop` range swept below (max 100ns one-way). Verified
+directly by inspecting the raw impulse response: with this resolution the
+full multi-bounce ladder is captured at its correct, well-separated
+arrival times (every ~400ns, decaying by a measured factor of ~0.51 per
+bounce — matching `Γ²=0.714²=0.51` for the `Zmismatch=300` case almost
+exactly) rather than folding onto the ~100ns pulse window.
 
-**Result — the hypothesis is correct, confirmed cleanly on both axes:**
+**Result, Part 1 — Panels A-C, a coarse (whole-nanosecond) `Tprop` grid:**
 
 - **Matched impedance (`Γ=0` exactly) costs nothing, at any delay** —
   infidelity stays at the numerical floor (~10⁻⁷) even at the longest
   delay tested. No reflection coefficient, no reflection, full stop.
 - **Mismatch alone, at short delay, costs nothing either** (Panel B,
   green): even the most severe mismatch tested (300Ω, `Γ≈0.71`) stays
-  within `[1.9×10⁻⁸, 1.4×10⁻⁷]` — indistinguishable from the floor — when
-  the round-trip delay (`2×Tprop`) is much shorter than the pulse
+  within `[-8.9×10⁻⁷, 7.5×10⁻⁷]` — indistinguishable from the floor —
+  when the round-trip delay (`2×Tprop`) is much shorter than the pulse
   duration. *Both* conditions are genuinely required.
-- **Both together produce smooth, then severe, degradation.** At fixed
-  `Γ=0.5`, infidelity climbs from `2.5×10⁻⁸` to `0.66` (Panel A) as the
-  round-trip-delay/pulse-duration ratio goes from 0.01 to 8 — not a hard
-  cliff like the pure-AM-AM achievability wall from the nonlinearity
-  investigations, but a continuous, eventually very steep, transition.
-  The crossover from clearly-negligible to clearly-significant sits close
-  to round-trip delay ≈ pulse duration — i.e. the user's original framing
-  holds almost exactly once "propagation delay" is read as the
-  **round-trip** time (there and back), the physically meaningful quantity
-  for a reflection (a one-way reading would put the crossover a factor of
-  2 later).
-- **At fixed long delay, infidelity grows smoothly and strongly with
-  `Γ`** (Panel B, red): from `5.0×10⁻⁷` at `Γ=0` up to `0.135` at
-  `Γ=0.71`. Confirmed symmetric in `Z` around 50Ω (`Z=25` and `Z=100`,
-  both `Γ=1/3`, give identical infidelity to 3 significant figures) —
-  the physics depends only on `|Γ|`, as it must.
-- Panel C's 2D sweep shows the combined picture directly: infidelity is
-  governed by the *product* of how severe the mismatch is and how long
-  the delay is, not by either alone.
+- **Both together, on this grid, produce only a small effect** — Panel A
+  spans `-8.9×10⁻⁷` to `8.3×10⁻⁶` over round-trip-delay/pulse-duration
+  ratios 0.04 to 8; Panel B's long-delay curve spans `1.9×10⁻⁷` to
+  `7.0×10⁻⁶` across `Γ=0` to `0.71`; Panel C's 2D sweep looks smooth and
+  unremarkable throughout.
 
-**Practical takeaway:** a drive line's impedance mismatches only need
-active attention when the electrical length between the mismatched points
-is comparable to or longer than the shortest pulses being driven through
-it — a mismatch right next to the qubit on a physically short line can be
-far less serious than the same mismatch reached only after a long cable,
-even though the *reflection coefficient* is identical in both cases.
+**This picture is an artifact of the sweep grid, not the physics — Part 2,
+Panel D, is the actual headline finding.** Every `Tprop` value used above
+(and in every regression test) is a whole number of nanoseconds. That is
+not a neutral choice: the carrier is exactly 5GHz, so a whole-nanosecond
+delay is *always* an exact integer number of carrier cycles. The reflected
+echo's carrier phase on arrival is `2π×5GHz×Tprop`, which is therefore
+*always* 0 (mod `2π`) at every single point Panels A-C sample — the safest
+possible phase, by construction, every time.
+
+Resolving `Tprop` at the sub-carrier-period scale (the carrier period is
+`1/5GHz = 0.2ns`) at a fixed severe mismatch (`Zmismatch=300`, `Γ=0.71`)
+shows what that coarse grid structurally cannot see: **infidelity swings
+from the numerical floor (`~7×10⁻⁶`) up to `0.54` within picoseconds of
+`Tprop`, periodic with the 0.2ns carrier period** (Panel D). Every
+whole-nanosecond `Tprop` sits exactly in one of the narrow safe notches;
+a cable a fraction of a millimeter different in length would not.
+
+**Is this a calibration gap or genuine distortion?** Tested directly, not
+assumed. The standard calibration (`tuneup_amplitude`, used everywhere
+above) picks a single *real* amplitude so the total X-quadrature
+(in-phase) rotation area hits `π`. A strictly stronger calibration was
+also tried: a *complex* (amplitude **and** phase) launch scale, chosen so
+the total `(X, Y)` rotation area lands exactly on `(π, 0)` — verified to
+land there to machine precision. If the sub-carrier-period sensitivity
+were just "wrong total area," this would cure it. **It does not** — Panel
+D's complex-scale curve tracks the real-scale curve within about a factor
+of 2 almost everywhere, including the same catastrophic peaks. The cause
+is that the reflected echo, at comparable amplitude to the direct pulse
+and overlapping its tail, makes the *instantaneous* drive axis wobble
+between X and Y during that overlap — rotations about different axes at
+different instants don't commute, so no single global rescale of a fixed
+pulse shape (real or complex) can undo a time-dependent axis wobble, only
+correct its net integrated total. This is genuine waveform distortion, in
+the same family as the nonlinearity-driven distortion elsewhere in this
+series — not a miscalibration that a better calibration routine would
+erase.
+
+**Practical takeaway:** whether a given impedance mismatch is dangerous
+depends on the round-trip delay's *phase relative to the carrier* at a
+sub-picosecond (sub-millimeter cable-length) precision that essentially no
+real setup controls or even measures — a comparably-sized reflection can
+be almost free or can badly scramble a gate depending on a cable length
+difference far below any practical tolerance. Critically, this cannot be
+fixed by a better amplitude or amplitude+phase calibration — the standard
+kind of calibration any real setup does — since the damage is in the
+pulse's shape, not its net rotation. A drive-line reflection with a
+comparable-amplitude echo overlapping the pulse should be treated as a
+potentially severe, effectively uncontrolled hazard, not the "forgiving,
+sub-percent impairment" that a coarse (or unlucky) parameter sweep would
+suggest.
 
 ---
 

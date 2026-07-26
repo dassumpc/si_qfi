@@ -49,10 +49,13 @@ class SimulationResult:
     and all diagnostic warnings. Pass to siq.quantum.gate_fidelity().
     """
     v_nl_qubit: np.ndarray          # Deterministic NL-distorted waveform, shape (N,)
-    v_qubit_ensemble: list[np.ndarray]  # v_nl_qubit + noise, one per realization
+    v_qubit_ensemble: list[np.ndarray]  # v_nl_qubit + noise, one per realization -- only meaningful when noise_enabled (see below)
     fs: float                       # Sample rate (Hz) shared by every array in this result
     mode: str                       # 'complex_baseband' or 'real_axis'
     carrier_freq_hz: float
+    noise_enabled: bool = False     # True iff a non-empty `noise` dict was passed to run() --
+                                     # lets gate_fidelity() know whether v_qubit_ensemble holds
+                                     # real stochastic realizations or is just a v_nl_qubit stand-in
     warnings: list[str] = field(default_factory=list)
     n_realizations: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
@@ -229,7 +232,8 @@ def run(
     # ------------------------------------------------------------------
     # PASS 2: NOISE PASS (stochastic)
     # ------------------------------------------------------------------
-    if noise:
+    noise_enabled = bool(noise)
+    if noise_enabled:
         propagator = NoisePropagator(
             noise_annotation=noise,
             transfer_functions_to_qubit=noise_tfs_to_qubit,
@@ -243,13 +247,13 @@ def run(
             for _ in range(n_realizations)
         ]
     else:
-        # No noise: all realizations are identical to the NL waveform
-        v_qubit_ensemble = [v_nl_qubit.copy() for _ in range(n_realizations)]
-        if n_realizations > 1:
-            sim_warnings.append(
-                "No noise nodes annotated; all realizations are identical. "
-                "Gate fidelity std will be zero."
-            )
+        # No noise: v_qubit_ensemble is not a real ensemble -- a single
+        # v_nl_qubit stand-in, not n_realizations redundant copies (that
+        # used to mean gate_fidelity() silently re-solved QuTiP
+        # n_realizations times for an identical result). gate_fidelity()
+        # uses v_nl_qubit directly for its noise-free result and only
+        # touches v_qubit_ensemble when noise_enabled is True.
+        v_qubit_ensemble = [v_nl_qubit.copy()]
 
     # ------------------------------------------------------------------
     # Emit collected warnings
@@ -263,6 +267,7 @@ def run(
         fs=fs_conv,
         mode=mode,
         carrier_freq_hz=source.carrier_freq_hz,
+        noise_enabled=noise_enabled,
         warnings=sim_warnings,
         n_realizations=n_realizations,
         extra={"intermediate_waveforms": intermediate_waveforms},

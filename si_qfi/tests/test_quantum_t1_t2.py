@@ -25,8 +25,7 @@ qutip = pytest.importorskip("qutip")
 warnings.filterwarnings("ignore", message="SI-QFI: Narrowband ratio")
 
 from si_qfi.schematic import loader as si_loader
-from si_qfi.simulation import engine
-from si_qfi.source.waveform import SourceWaveform, build_gaussian_envelope
+from si_qfi.source.waveform import build_gaussian_envelope
 from si_qfi import quantum
 
 SCHEMATIC_PATH = (Path(__file__).parent / "test_schematic_basic.si").resolve()
@@ -40,32 +39,22 @@ def _qubit_model_2lvl():
     return quantum.QubitModel(H0=0 * qutip.qeye(2), n_levels=2)
 
 
-def _source_from_shape(shape, fs, carrier_ghz):
-    from SignalIntegrity.Lib.TimeDomain.Waveform.Waveform import Waveform
-    from SignalIntegrity.Lib.TimeDomain.Waveform.TimeDescriptor import TimeDescriptor
-
-    n = len(shape)
-    envelope = Waveform(TimeDescriptor(0.0, n, fs), list(shape.astype(complex)))
-    return SourceWaveform(carrier_freq_ghz=carrier_ghz, envelope=envelope)
-
-
 def _infidelity_and_true_gate_time(schematic, duration_s, qmodel, T1_us=None, T2_us=None):
+    """Calibrates (via tuneup_amplitude(), no T1_us/T2_us -- noise-free
+    objective) then evaluates the final fidelity WITH T1_us/T2_us in a
+    separate gate_fidelity() call, at the tuned scale."""
     sigma_s = duration_s / 6
     ref_shape = build_gaussian_envelope(duration_s, sigma_s, _FS_ENVELOPE, amp=1.0)
-    source_ref = _source_from_shape(ref_shape, _FS_ENVELOPE, _CARRIER_GHZ)
-    result_ref = engine.run(schematic, source_ref, nonlinear=None, noise=None, n_realizations=1, mode="complex_baseband")
-    v = np.asarray(result_ref.v_nl_qubit)
-    t = np.arange(len(v)) / result_ref.fs
-    theta_ref = float(_ETA * np.trapz(np.real(v), t))
-    cal_shape = ref_shape * (np.pi / theta_ref)
-
-    source = _source_from_shape(cal_shape, _FS_ENVELOPE, _CARRIER_GHZ)
-    result = engine.run(schematic, source, nonlinear=None, noise=None, n_realizations=1, mode="complex_baseband")
+    tuned = quantum.tuneup_amplitude(
+        schematic, ref_shape, _FS_ENVELOPE, _CARRIER_GHZ,
+        qmodel, coupling_strength_per_volt=_ETA, ideal_gate="X", mode="complex_baseband",
+    )
+    result = tuned.result
     T_gate_true = (len(result.v_qubit_ensemble[0]) - 1) / result.fs
     fid = quantum.gate_fidelity(
         result, qmodel, ideal_gate="X", coupling_strength_per_volt=_ETA, T1_us=T1_us, T2_us=T2_us,
     )
-    return 1.0 - fid.F_avg, T_gate_true
+    return 1.0 - fid.noise_free.F_avg, T_gate_true
 
 
 @pytest.fixture
