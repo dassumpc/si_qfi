@@ -67,7 +67,11 @@ class QubitModel(QubitBase):
                 a = qt.destroy(self.n_levels)
                 self.drive_op = a + a.dag()
             except ImportError:
-                pass   # QuTiP not installed; Cursor will wire this up
+                pass   # QuTiP not installed at construction time -- fine, since
+                        # QubitModel is a plain dataclass with no QuTiP dependency
+                        # of its own; drive_op stays None until something that
+                        # actually needs QuTiP (build_hamiltonian(), gate_fidelity())
+                        # is called, which already requires QuTiP to be installed.
 
     def as_qubit_model(self) -> "QubitModel":
         """Already a QubitModel -- returns self."""
@@ -152,16 +156,32 @@ class Transmon(QubitBase):
 
 def from_scqubits(scq_qubit, n_levels: int = 5) -> QubitModel:
     """
-    Build a QubitModel from a scqubits qubit object.
+    Build a QubitModel from an scqubits qubit object (e.g.
+    `scq.Transmon(EJ=20.0, EC=0.2, ng=0.0, ncut=30)`), truncating its full
+    Hamiltonian to the top-level `n_levels` states.
 
-    # --- CURSOR NOTE ---
-    # scqubits API (verify against installed version):
-    #   transmon = scq.Transmon(EJ=20.0, EC=0.2, ng=0.0, ncut=30)
-    #   H0_full = transmon.hamiltonian()   # large sparse Qobj
-    #   # Truncate to n_levels:
-    #   H0 = transmon.hamiltonian()[:n_levels, :n_levels]  # or use scq's truncation
-    # Confirm the truncation API — scqubits may provide a direct method.
-    # -------------------
+    STATUS: implemented but not yet exercised against a real scqubits
+    install in this codebase's own tests/investigations -- everything in
+    `tests/`/`examples/` uses the analytic `Transmon`/`QubitModel` classes
+    instead, which are fully verified. The truncation here
+    (`H0_full.full()[:n_levels, :n_levels]`, a naive corner-slice of the
+    full dense Hamiltonian matrix) is the straightforward approach; scqubits
+    may also expose a dedicated truncation method worth checking against
+    before relying on this for a large Hilbert space.
+
+    Parameters
+    ----------
+    scq_qubit
+        Any scqubits qubit object exposing `.hamiltonian()` (a QuTiP Qobj
+        or array-like).
+    n_levels : int
+        Number of levels to retain after truncation (default 5).
+
+    Returns
+    -------
+    QubitModel
+        H0 = the truncated Hamiltonian, drive_op left at QubitModel's own
+        default (destroy(n_levels) + destroy(n_levels).dag()).
     """
     H0_full = scq_qubit.hamiltonian()
     # Truncate to n_levels

@@ -546,6 +546,188 @@ the practically-limiting number even when T1 looks fine.
 
 ---
 
+## 8. Drive-line noise density vs. gate infidelity — and the absolute-scale bug hunt that made it trustworthy
+
+**Script:** `examples/noise_density_sweep_demo.py` · **Tests:** `tests/test_quantum_noise_density_sweep.py`, `tests/test_noise.py`, `tests/test_engine_noise.py` · **Figure:** `examples/noise_density_sweep_demo.png`
+
+**Motivation.** The `noise/` subpackage (PSD computation, stochastic
+realization generation, `NoisePropagator`) had been fully implemented and
+unit-tested since early in the project but had never been exercised by an
+investigation — the open question this closes was simply "how does
+drive-chain-injected noise cost gate fidelity as its density grows,
+end-to-end through a real SI schematic and QuTiP?"
+
+**A real trap, found and fixed while building this — the biggest one in
+this log.** Getting a *trustworthy* answer required first fixing two
+independent, exactly-compensating absolute-scale bugs in `noise/
+realization.py` that had survived every prior internal cross-check:
+`generate_baseband_noise()` was originally missing the bandpass-to-envelope
+conversion entirely, "fixed" once to `Var=8·S_v·B`, and `generate_rf_noise()`
+was independently 2x too strong (`S_v·fs` instead of the correct
+`S_v·fs/2`, the plain Johnson-Nyquist "noise power in bandwidth" result).
+Because both errors inflated variance by the same 2x, every real_axis-vs-
+baseband cross-check (the tests already compare the two modes' noise
+propagation directly) kept passing throughout — internal consistency
+between the two generators gave zero signal that either was wrong. The bugs
+were only caught by validating each generator's *absolute* scale against an
+outside reference instead of against each other: `scipy.signal.
+periodogram` on `generate_rf_noise()`'s own output directly, and a from-
+scratch, zero-`si_qfi`-imports notebook re-derivation
+(`notebooks/noise_psd_pure_numpy_derivation.ipynb`) for the bandpass-to-
+envelope factor itself. Corrected result: `generate_rf_noise()` gives
+`Var=S_v·fs/2` (matching `scipy.signal.periodogram` to <1%), and
+`generate_baseband_noise()` gives `Var=4·S_v·B` — both now covered by tests
+that check the absolute scale directly (`test_rf_noise_variance`,
+`test_baseband_noise_variance`, `test_real_axis_demodulated_matches_
+baseband_directly` in `tests/test_noise.py`), not just internal agreement
+between the two modes.
+
+**Result.** Sweeping the (SI-native Johnson-noise-configured) drive-line
+noise source's PSD over `1e-20` to `1e-10` V²/Hz produced a visible "hump"
+at low density — infidelity dipping and rising non-monotonically instead of
+cleanly tracking the expected small-perturbation power law. Diagnosis: at
+low density, noise-driven infidelity is comparable to or smaller than the
+intrinsic finite-ensemble Monte Carlo floor (~1e-7, the same floor
+documented in Investigation 1/7), so those points are statistical scatter,
+not a real feature. Restricting the power-law fit to points that clear 3x
+that floor (marked with hollow vs. filled markers in the figure) gives a
+clean `infidelity ~ psd^1.00` — exactly linear, matching first-order
+small-perturbation theory, over more than 3 decades of PSD. The demo also
+introduced `quantum.pulse_snr()` (windowed signal-power/noise-power ratio,
+now a permanent public utility — see `quantum/snr.py`) and re-plots the
+same sweep reparameterized as infidelity vs. effective SNR.
+
+**Practical takeaway:** an internal cross-check between two independently-
+implemented code paths that "agree with each other" is not evidence either
+one is *correct* — only evidence they share the same convention, bug or
+not. Absolute-scale claims need an outside reference (a standard library
+function, a from-scratch independent re-derivation) to actually validate,
+not just self-consistency.
+
+---
+
+## 9. Does noise "color" matter as much as noise power — and can a filter function be measured empirically?
+
+**Script:** `examples/noise_filter_function_demo.py` · **Tests:** `tests/test_noise.py` (colored-PSD override tests) · **Figure:** `examples/noise_filter_function_demo.png`
+
+**Motivation.** Every noise investigation up to this point used flat
+(white) PSDs — same total power, same infidelity, regardless of where in
+frequency that power sits. A first-order (Magnus/toggling-frame)
+sensitivity analysis of a resonant Rabi drive predicts otherwise: noise on
+the same axis as the drive (I-quadrature) accumulates as a flat,
+unweighted time integral (an *exact* result — same-axis noise commutes
+with the drive Hamiltonian pointwise), while noise on the orthogonal
+(Q) quadrature picks up a weight involving the accumulated rotation angle
+θ(t) via `sin(θ(t))`/`cos(θ(t))`, not the pulse shape Ω(t) itself (see
+`quantum/snr.py`'s own docstring for the derivation). Via Parseval, a flat
+time-domain weight corresponds to a frequency-domain sensitivity peaked at
+DC — i.e. slow ("quasi-static") noise should cost far more than fast
+(white) noise of identical total power. This investigation tests that
+prediction directly against the full QuTiP solve.
+
+**New capability this required:** `noise/psd.py`'s `single_sided_psd_v2_
+per_hz` override now accepts a callable `freqs->S_v(freqs)` for a colored
+PSD, not just a flat number — `noise/realization.py` already supported an
+arbitrary-shaped PSD array internally, only the engine-facing override-spec
+parser was flat-only.
+
+**Result (three experiments, all confirmed):**
+- Same total noise power (`Var=6.00e-4 V²`), redistributed from flat-
+  across-baseband to a 1MHz-wide spike at DC: **198.6x worse infidelity**
+  (`2.50e-3` vs. `1.26e-5`) — frequency distribution alone, nothing else
+  changed.
+- A narrow (2MHz-wide) noise probe swept from 5MHz to 1GHz traces a clean,
+  monotonically-decreasing empirical susceptibility curve spanning ~6
+  decades of infidelity — the qubit's own noise filter function, measured
+  via one full ensemble QuTiP solve per frequency point, no perturbation
+  theory involved in the measurement itself.
+- An *unfitted* theory curve (equal-weight sum of the flat I-channel term
+  and the `sin(θ(t))`/`cos(θ(t))` Q-channel terms, computed directly from
+  the realized pulse's own θ(t), zero free parameters) tracks the empirical
+  curve closely through the entire rolloff. Neither the flat term nor
+  either Q-channel term alone matches nearly as well — only the combination
+  reproduces the measured shape.
+
+**Practical takeaway:** a "total noise power" or flat-PSD metric is
+incomplete on its own — the SAME power, differently distributed in
+frequency, can cost two orders of magnitude more or less fidelity. The
+empirical-susceptibility-sweep method demonstrated here is a general,
+reusable diagnostic (no perturbation theory required to *measure* it, only
+to predict it in advance).
+
+---
+
+## 10. LO/oscillator phase noise: a genuinely different noise mechanism, and why it needed real engine changes
+
+**Script:** `examples/phase_noise_case_study_demo.py` · **Tests:** `tests/test_engine_phase_noise.py`, `tests/test_noise.py` (phase-noise PSD spec tests) · **Figure:** `examples/phase_noise_case_study_demo.png`
+
+**Motivation.** All prior noise investigations model *additive* noise on
+the drive line (a voltage independent of the drive itself). LO phase noise
+is a distinct mechanism, explicitly flagged as "Future Feature — Not Yet
+Implemented" in the original PRD (§7.4): a noisy carrier gives
+`v(t)=Re{ũ(t)·exp(j(2πf_c t+φ(t)))}`, i.e. `ũ_noisy(t)≈ũ(t)+jφ(t)·ũ(t)` to
+first order — **multiplicative**, proportional to the instantaneous drive
+envelope itself, not an independent process. It also originates *upstream*
+of any nonlinearity in the drive chain, so a compressing amplifier sees and
+reshapes the already phase-perturbed waveform.
+
+**A real architecture change, not just a new noise-injection point.**
+Because phase noise is injected at the source, `engine.run()`'s nonlinear
+pass (previously computed once, deterministically, and reused for every
+noise realization) now re-runs once per Monte Carlo realization whenever
+`phase_noise=` is given — each with its own phase draw applied before
+propagation. This was scoped carefully before building: `_nonlinear_pass()`
+and `gate_fidelity()`'s `_solve_one()` were already pure, per-call
+functions with no cross-call state, so this was additive/opt-in (zero
+behavior change when `phase_noise` is unused), not a rewrite. New public
+surface: `engine.run(phase_noise={...})`, requiring an explicit
+`bandwidth_hz` (unlike voltage noise, a real oscillator's phase-noise floor
+never rolls off to zero, so there's no default bandwidth to inherit from
+the simulation's own sample rate — see `noise/psd.py`'s `phase_noise_psd_
+from_spec()`).
+
+**Result (three parts, including two dead ends reported honestly):**
+- Phase noise alone (no nonlinearity) costs real gate fidelity, scaling
+  cleanly linearly with PSD (`infidelity ~ S_φ^1.00`) over 4 decades.
+- **The case study**: comparing the real (pre-NL) implementation against
+  the physically-wrong alternative of rotating a single shared
+  deterministic waveform *after* the nonlinear pass has already run once,
+  across 5 independently-recalibrated compression levels — pre-NL infidelity
+  sits consistently above post-hoc at all 5 points (14-17% relative
+  discrepancy; individual points' SEM-based error bars overlap somewhat at
+  N=250 realizations, but 5/5 points landing on the same side has <4% odds
+  under pure statistical noise, a simple sign-test argument). Two design
+  mistakes surfaced and were fixed, not hidden, along the way: an initial
+  sweep drove the amplifier into full saturation (0.0% measured
+  difference — not because the effect isn't real, but because saturating a
+  nonlinearity flattens its sensitivity to small input differences
+  entirely), and `tuneup_amplitude()`'s own calibration search was found to
+  land on a spurious solution (an obviously-wrong, wildly non-monotonic
+  scale factor) for a band of intermediate `op1db_amplitude` values despite
+  reporting `achieved=True` — a real robustness gap in that search, worked
+  around here by avoiding the bad region, not yet fixed at the source.
+- `bandwidth_hz` convergence: for a realistic (Lorentzian, rolling-off)
+  phase-noise shape, infidelity converges cleanly by ~4x the pulse's
+  natural bandwidth and stays flat out to 16x. A flat PSD, tested first,
+  never converged at all over the same range — not a bug, but the wrong
+  test: a flat spectrum has no natural power ceiling to converge against.
+  Follow-up check: at the flat PSD's widest tested point, RMS phase noise
+  reaches ~27° — genuinely leaving small-angle validity — but a direct
+  check of the exact-vs-linear Gaussian-phase envelope-variance correction
+  did *not* explain the specific late-stage growth acceleration observed,
+  so which mechanism (slow filter-function tail, non-monotonic filter-
+  function structure, or some other nonlinear phase-statistics effect)
+  actually dominates there remains open.
+
+**Practical takeaway:** "post-hoc" noise injection (add noise onto an
+already-computed deterministic result) is only exact when nothing
+nonlinear sits between the noise source and the qubit plane — true for
+additive drive-line noise entering the existing two-pass architecture by
+design, false for phase noise once real compression is in the loop, and
+confirmed here to be a measurable (not just theoretical) difference.
+
+---
+
 ## Open questions for future investigations
 
 - Investigation 6 answered the "does AM-AM's result hold for a multi-level
@@ -560,11 +742,43 @@ the practically-limiting number even when T1 looks fine.
   competing with a fast, leakage-heavy pulse)? Not yet tested — needs a
   generalized T2 dephasing operator for `n_levels > 2` first (`gate_
   fidelity()`'s T2 branch is `n_levels=2`-only today).
-- Noise (the noise/ subpackage: PSD, stochastic realizations,
-  NoisePropagator) is fully implemented and unit-tested but has never been
-  exercised by an investigation — how does drive-chain-injected noise
-  (amplifier noise figure, etc.) compare in scale to the intrinsic T1/T2
-  decoherence characterized in Investigation 7?
+- Investigation 8 exercises the noise/ subpackage end to end for the first
+  time (and found real absolute-scale bugs doing so), but doesn't directly
+  compare drive-chain-injected noise's infidelity cost, in absolute terms,
+  against the intrinsic T1/T2 decoherence characterized in Investigation
+  7 — different schematics, different gate durations. A direct, matched
+  comparison (same pulse, same gate time, noise-only vs. T1/T2-only vs.
+  both) is still open.
+- Every noise mechanism implemented so far (Investigations 8-10, plus the
+  original noise/ subpackage) couples through σx/σy only (drive-line
+  amplitude/phase, entering the Hamiltonian via `coupling_strength_per_
+  volt`) — there is currently no way to inject σz (detuning/dephasing)
+  noise, the mechanism behind flux noise, charge noise, and most "1/f
+  noise" discussions in the superconducting-qubit literature. T1_us/T2_us
+  provide a *Markovian* (fixed-rate Lindblad) approximation to dephasing,
+  not a genuinely time-varying, correlated stochastic detuning process.
+  Would need a new, parallel noise-injection point (a per-realization Δ(t)
+  array feeding a `[qt.sigmaz(), coeff_delta(t)]` term in `build_
+  hamiltonian()`, alongside the fixed `H0`) — scoped in discussion but not
+  built.
+- Investigation 10 found `tuneup_amplitude()`'s calibration search lands on
+  a spurious, wildly-wrong solution for a band of intermediate
+  `op1db_amplitude` values (a scale factor ~100x too large, on the
+  amplifier's declining branch) despite reporting `achieved=True` — a real
+  robustness gap in the search itself (worked around by avoiding the bad
+  region in that investigation, not fixed). Worth its own investigation:
+  characterize exactly which regime triggers it and harden the search
+  against it.
+- Investigation 10's flat-PSD bandwidth sweep showed infidelity still
+  growing (not leveling off, and even accelerating in one interval) out to
+  16x the pulse's natural bandwidth, well past where RMS phase noise
+  (~27° at the widest point tested) leaves small-angle validity — but a
+  direct check of the exact-vs-linear Gaussian-phase envelope-variance
+  correction didn't explain the specific growth pattern. Which mechanism
+  actually dominates (a slowly-decaying or non-monotonic phase-noise
+  filter function, vs. some other nonlinear phase-statistics effect) is
+  unresolved; would need a dedicated sweep isolating phase-noise level
+  from bandwidth to separate the two candidate explanations.
 - Does the two-amplifier gray zone (Investigation 3) grow or shrink with
   the inter-stage channel's dispersion (i.e. is a *less* dispersive line
   between amplifiers more forgiving, or does any nonzero delay/dispersion

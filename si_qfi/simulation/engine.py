@@ -28,14 +28,15 @@ from scipy.signal import fftconvolve
 from ..schematic.loader import SISchematic, validate_node_labels
 from ..schematic.transfer_function import (
     extract_all_transfer_functions,
-    extract_noise_transfer_functions,
     compute_impulse_response,
     native_sample_rate,
     compute_isolation_db,
 )
+from ..schematic.noise import extract_noise_source_transfer_functions
 from ..source.waveform import SourceWaveform
 from ..nonlinear.registry import build_nonlinear_nodes
 from ..noise.propagation import NoisePropagator
+from ..noise.psd import psd_cache_for_noise_nodes
 
 
 # ---------------------------------------------------------------------------
@@ -48,14 +49,23 @@ class SimulationResult:
     Output of siq.run(). Contains the ensemble of qubit-plane waveforms
     and all diagnostic warnings. Pass to siq.quantum.gate_fidelity().
     """
-    v_nl_qubit: np.ndarray          # Deterministic NL-distorted waveform, shape (N,)
-    v_qubit_ensemble: list[np.ndarray]  # v_nl_qubit + noise, one per realization -- only meaningful when noise_enabled (see below)
+    v_nl_qubit: np.ndarray          # Deterministic NL-distorted waveform, shape (N,) -- the
+                                     # phi=0 (no phase noise), no-additive-noise baseline, always
+                                     # from exactly one _nonlinear_pass() call regardless of
+                                     # phase_noise_enabled (see run()'s module docstring)
+    v_qubit_ensemble: list[np.ndarray]  # per realization -- only meaningful when noise_enabled (see below)
     fs: float                       # Sample rate (Hz) shared by every array in this result
     mode: str                       # 'complex_baseband' or 'real_axis'
     carrier_freq_hz: float
-    noise_enabled: bool = False     # True iff a non-empty `noise` dict was passed to run() --
-                                     # lets gate_fidelity() know whether v_qubit_ensemble holds
-                                     # real stochastic realizations or is just a v_nl_qubit stand-in
+    noise_enabled: bool = False     # True iff v_qubit_ensemble holds real stochastic
+                                     # realizations (additive noise and/or phase noise) rather
+                                     # than being a v_nl_qubit stand-in -- lets gate_fidelity()
+                                     # know whether to build a real ensemble result
+    phase_noise_enabled: bool = False   # True iff a non-empty `phase_noise` dict was passed to
+                                         # run() -- lets a caller tell WHY noise_enabled is True
+                                         # (additive noise, phase noise, or both) without
+                                         # re-deriving it; gate_fidelity() itself doesn't need
+                                         # this distinction, only noise_enabled
     warnings: list[str] = field(default_factory=list)
     n_realizations: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
@@ -98,6 +108,7 @@ def run(
     source: SourceWaveform,
     nonlinear: Optional[dict[str, Any]] = None,
     noise: Optional[dict[str, Any]] = None,
+    phase_noise: Optional[dict[str, Any]] = None,
     n_realizations: int = 100,
     mode: str = "complex_baseband",
     isolation_threshold_db: float = _ISOLATION_THRESHOLD_DB,
@@ -117,10 +128,38 @@ def run(
         Nonlinear node annotation dict {probe_label: spec_dict}.
         If None, no nonlinearity is applied.
     noise : dict, optional
-        Noise node annotation dict {probe_label: spec_dict}.
-        If None, all realizations are identical to v_nl_qubit (noiseless).
+        Noise annotation dict {noise_source_name: override_dict}. Keys name
+        statistical-noise-source devices declared in the SI schematic (see
+        schematic.noise_source_names) -- a different namespace than probe
+        labels. Presence in the dict enables that source; override_dict is
+        `{}` to use SI's own computed spectral density for that device
+        (Johnson/shot/white/etc, per its own schematic-configured
+        properties), or `{"single_sided_psd_v2_per_hz": ...}` /
+        `{"single_sided_psd_dbm_hz": ...}` to inject a flat PSD instead
+        (still propagated via that device's own schematic location/transfer
+        function -- see noise/psd.py). If None/empty, all realizations are
+        identical to v_nl_qubit (noiseless).
+    phase_noise : dict, optional
+        LO/oscillator phase-noise spec, e.g.
+        {"single_sided_psd_rad2_per_hz": callable_or_number, "bandwidth_hz": ...}
+        or {"dbc_hz": callable, "bandwidth_hz": ...} -- see
+        noise/psd.py's phase_noise_psd_from_spec() for the full contract
+        (in particular why 'bandwidth_hz' is required, with no default).
+        Unlike `noise`, this is a SINGLE spec for the whole run, not keyed
+        by schematic node -- phase noise belongs to the one LO/carrier the
+        entire drive is built from, not to any particular schematic
+        location. Physically distinct from `noise` (see
+        examples/phase_noise_case_study_demo.py's module docstring):
+        it's MULTIPLICATIVE (rides on the drive envelope itself,
+        `ũ(t)·exp(j*phi(t))`, rather than adding independently of it) and,
+        critically, it's injected at the SOURCE, before the nonlinear pass
+        -- so when phase_noise is given, _nonlinear_pass() is re-run once
+        per realization (each with its own phase draw) rather than once
+        total. If None/empty, behavior (and cost) is identical to before
+        this parameter existed.
     n_realizations : int
-        Number of stochastic noise realizations. Ignored if noise is None.
+        Number of stochastic realizations (additive noise and/or phase
+        noise). Ignored if both noise and phase_noise are None/empty.
     mode : str
         'complex_baseband' (default) or 'real_axis'.
     isolation_threshold_db : float
@@ -137,6 +176,7 @@ def run(
     sim_warnings: list[str] = []
     nonlinear = nonlinear or {}
     noise = noise or {}
+    phase_noise = phase_noise or {}
 
     # ------------------------------------------------------------------
     # Validate mode selection
@@ -150,7 +190,9 @@ def run(
     # mismatched label here would otherwise be silently ignored downstream.
     # ------------------------------------------------------------------
     validate_node_labels(schematic, nonlinear.keys(), kind="nonlinear")
-    validate_node_labels(schematic, noise.keys(), kind="noise")
+    validate_node_labels(
+        schematic, noise.keys(), kind="noise", known=schematic.noise_source_names,
+    )
 
     # nl_labels is the single source of truth for NL propagation order —
     # the nonlinear dict's key order (PRD §3.5) — passed to every downstream
@@ -174,7 +216,7 @@ def run(
     # ------------------------------------------------------------------
     raw_segment_tfs = extract_all_transfer_functions(schematic, nl_labels)
     raw_noise_tfs = (
-        extract_noise_transfer_functions(schematic, list(noise.keys()))
+        extract_noise_source_transfer_functions(schematic, list(noise.keys()))
         if noise else {}
     )
 
@@ -199,13 +241,23 @@ def run(
     #   - complex_baseband: unchanged -- the envelope's own fs/carrier
     #     determine the grid H(f) is interpolated onto.
     # ------------------------------------------------------------------
+    # t_resampled/env_resampled (the complex envelope BEFORE carrier
+    # modulation, at fs_conv) are kept around uniformly across both modes --
+    # not just for real_axis -- because phase-noise injection (below) needs
+    # to rotate the envelope by exp(j*phi(t)) BEFORE modulation regardless
+    # of mode; in complex_baseband mode there IS no separate modulation
+    # step, so env_resampled/t_resampled and v_initial coincide exactly.
     if mode == "real_axis":
         fs_conv = native_sample_rate(next(iter(raw_segment_tfs.values())))
         source.check_sample_rate_for_real_axis(fs_conv, harmonic_order=3)
-        _, v_initial = source.rf_waveform_at(fs_conv)
+        t_resampled, env_resampled = source.resampled_envelope_at(fs_conv)
+        carrier = np.exp(1j * 2 * np.pi * source.carrier_freq_hz * t_resampled)
+        v_initial = np.real(env_resampled * carrier)
     else:
         fs_conv = source.fs
-        v_initial = source.envelope_complex.copy()
+        t_resampled = source.t
+        env_resampled = source.envelope_complex.copy()
+        v_initial = env_resampled.copy()
 
     # fs_conv/carrier_hz are only actually used by compute_impulse_response()
     # in complex_baseband mode -- real_axis mode ignores both and derives its
@@ -233,27 +285,109 @@ def run(
     # PASS 2: NOISE PASS (stochastic)
     # ------------------------------------------------------------------
     noise_enabled = bool(noise)
-    if noise_enabled:
-        propagator = NoisePropagator(
-            noise_annotation=noise,
+    phase_noise_enabled = bool(phase_noise)
+    ensemble_enabled = noise_enabled or phase_noise_enabled
+
+    def _build_additive_noise_propagator() -> NoisePropagator:
+        # Target length must match v_nl_qubit's own (grown) length, not
+        # v_initial's pre-convolution length -- v_nl_qubit is longer by
+        # len(h)-1 per segment (see _nonlinear_pass's docstring: "full",
+        # untruncated linear convolution), and generate_realization()'s
+        # output is added directly to a v_nl_qubit-length array below, so it
+        # must land at that same length or the addition doesn't broadcast.
+        # Noise is drawn over the qubit plane's own full duration,
+        # independent of how long the deterministic drive's own convolution
+        # happened to grow it -- physically correct (noise is present for as
+        # long as the qubit exists in that window), not just a shape fix.
+        # Valid to reuse across every realization (including the per-
+        # phase-noise-draw ones below): every v_nl_qubit_i has the SAME
+        # length as v_nl_qubit, since it's the same fixed segment_tfs/h_k
+        # arrays applied to a same-length (only VALUES differ) input.
+        h_lengths = {label: len(h) for label, h in noise_tfs_to_qubit.items()}
+        psd_cache = psd_cache_for_noise_nodes(
+            schematic, noise, len(v_nl_qubit), fs_conv, h_lengths,
+        )
+        return NoisePropagator(
+            psd_cache=psd_cache,
             transfer_functions_to_qubit=noise_tfs_to_qubit,
-            n_samples=len(v_initial),
+            n_samples=len(v_nl_qubit),
             fs=fs_conv,
             mode=mode,
         )
+
+    if not ensemble_enabled:
+        # Neither kind of noise: v_qubit_ensemble is not a real ensemble --
+        # a single v_nl_qubit stand-in, not n_realizations redundant copies
+        # (that used to mean gate_fidelity() silently re-solved QuTiP
+        # n_realizations times for an identical result). gate_fidelity()
+        # uses v_nl_qubit directly for its noise-free result and only
+        # touches v_qubit_ensemble when noise_enabled is True.
+        v_qubit_ensemble = [v_nl_qubit.copy()]
+
+    elif not phase_noise_enabled:
+        # Additive noise only -- the original, cheap path: v_nl_qubit is
+        # computed once (above) and reused for every realization, only the
+        # additive draw varies.
+        propagator = _build_additive_noise_propagator()
         rng = np.random.default_rng(seed)
         v_qubit_ensemble = [
             v_nl_qubit + propagator.generate_realization(rng)
             for _ in range(n_realizations)
         ]
+
     else:
-        # No noise: v_qubit_ensemble is not a real ensemble -- a single
-        # v_nl_qubit stand-in, not n_realizations redundant copies (that
-        # used to mean gate_fidelity() silently re-solved QuTiP
-        # n_realizations times for an identical result). gate_fidelity()
-        # uses v_nl_qubit directly for its noise-free result and only
-        # touches v_qubit_ensemble when noise_enabled is True.
-        v_qubit_ensemble = [v_nl_qubit.copy()]
+        # Phase noise enabled (with or without additive noise on top): the
+        # nonlinear pass genuinely depends on the phase draw (the
+        # nonlinearity sees and reshapes the phase-perturbed waveform, and
+        # even a purely LINEAR but dispersive channel treats phase-
+        # modulation sidebands differently from the carrier -- see
+        # run()'s phase_noise docstring), so it must be re-run once per
+        # realization rather than once total. See examples/
+        # phase_noise_case_study_demo.py for a direct, worked comparison
+        # against the (physically wrong, for this reason) alternative of
+        # adding phase noise post-hoc onto the shared v_nl_qubit.
+        from ..noise.psd import phase_noise_psd_from_spec
+        from ..noise.realization import generate_phase_noise
+
+        bandwidth_hz = float(phase_noise["bandwidth_hz"])
+        nyquist_hz = fs_conv / 2.0
+        if bandwidth_hz > nyquist_hz:
+            sim_warnings.append(
+                f"phase_noise bandwidth_hz={bandwidth_hz:.3e} Hz exceeds what "
+                f"mode='{mode}' can represent at fs={fs_conv:.3e} Hz "
+                f"(Nyquist={nyquist_hz:.3e} Hz) -- clipped to the representable "
+                f"range; the requested phase-noise content above {nyquist_hz:.3e} Hz "
+                + ("is lost. Consider mode='real_axis' for a much higher native rate."
+                   if mode == "complex_baseband" else "is lost.")
+            )
+            bandwidth_hz = nyquist_hz
+
+        n_draw = len(v_initial)   # phi(t) is applied BEFORE convolution grows the array
+        freqs_phi = np.fft.rfftfreq(n_draw, d=1.0 / fs_conv)
+        phase_noise_spec = dict(phase_noise)
+        phase_noise_spec["bandwidth_hz"] = bandwidth_hz   # possibly clipped above
+        phase_psd = phase_noise_psd_from_spec(phase_noise_spec, freqs_phi)
+
+        propagator = _build_additive_noise_propagator() if noise_enabled else None
+        rng = np.random.default_rng(seed)
+
+        v_qubit_ensemble = []
+        for _ in range(n_realizations):
+            phi_i = generate_phase_noise(n_draw, fs_conv, phase_psd, rng=rng)
+            v_initial_i = _apply_phase_noise(mode, env_resampled, t_resampled, source.carrier_freq_hz, phi_i)
+            # Throwaway warnings list: any warning _nonlinear_pass can raise
+            # (e.g. "no transfer function for segment") is structural, about
+            # the schematic/segmentation, not about a specific phase draw --
+            # already captured once above when v_nl_qubit was computed, so
+            # collecting it again n_realizations times here would just spam
+            # duplicates.
+            v_nl_qubit_i, _ = _nonlinear_pass(
+                v_initial_i, nl_labels, nl_nodes, segment_tfs, mode, [],
+                source_label, qubit_label,
+            )
+            if propagator is not None:
+                v_nl_qubit_i = v_nl_qubit_i + propagator.generate_realization(rng)
+            v_qubit_ensemble.append(v_nl_qubit_i)
 
     # ------------------------------------------------------------------
     # Emit collected warnings
@@ -267,7 +401,8 @@ def run(
         fs=fs_conv,
         mode=mode,
         carrier_freq_hz=source.carrier_freq_hz,
-        noise_enabled=noise_enabled,
+        noise_enabled=ensemble_enabled,
+        phase_noise_enabled=phase_noise_enabled,
         warnings=sim_warnings,
         n_realizations=n_realizations,
         extra={"intermediate_waveforms": intermediate_waveforms},
@@ -363,6 +498,56 @@ def _nonlinear_pass(
         intermediate_waveforms[lout] = v.copy()
 
     return v, intermediate_waveforms
+
+
+def _apply_phase_noise(
+    mode: str,
+    env_resampled: np.ndarray,
+    t_resampled: np.ndarray,
+    carrier_hz: float,
+    phi: np.ndarray,
+) -> np.ndarray:
+    """
+    Rotate the (pre-modulation) complex envelope by a phase-noise
+    realization phi(t) [rad], then modulate onto the carrier if this mode
+    needs a real RF waveform -- the source-side counterpart to
+    run()'s `phase_noise` parameter.
+
+    Mirrors quantum.demodulate()'s own physics in reverse: a noisy LO gives
+    v(t) = Re{ũ(t)·exp(j(2*pi*f_c*t + phi(t)))} = Re{[ũ(t)·exp(j*phi(t))]·
+    exp(j*2*pi*f_c*t)} -- i.e. phase noise is exactly a rotation of the
+    envelope PRIOR to modulation, regardless of mode. In complex_baseband
+    mode there is no separate modulation step at all (the "RF waveform" IS
+    the envelope), so this reduces to just the rotation.
+
+    Parameters
+    ----------
+    mode : str
+        'complex_baseband' or 'real_axis'.
+    env_resampled : np.ndarray, complex128
+        The envelope at the sample rate actually used for propagation this
+        run (fs_conv) -- equals v_initial itself in complex_baseband mode,
+        or the resampled-but-not-yet-modulated envelope in real_axis mode
+        (see SourceWaveform.resampled_envelope_at()).
+    t_resampled : np.ndarray
+        Time array (seconds) matching env_resampled -- only used to build
+        the carrier in real_axis mode.
+    carrier_hz : float
+    phi : np.ndarray, float64
+        Phase-noise realization (radians), same length as env_resampled.
+
+    Returns
+    -------
+    np.ndarray
+        Complex (complex_baseband) or real (real_axis) waveform, same
+        length as env_resampled -- suitable as _nonlinear_pass()'s
+        initial_waveform.
+    """
+    env_noisy = env_resampled * np.exp(1j * phi)
+    if mode == "complex_baseband":
+        return env_noisy
+    carrier = np.exp(1j * 2 * np.pi * carrier_hz * t_resampled)
+    return np.real(env_noisy * carrier)
 
 
 # ---------------------------------------------------------------------------

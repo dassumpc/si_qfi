@@ -55,6 +55,18 @@ _PROBE_PARTNAMES = (
 # netlist DeviceName values that count as a voltage/current source.
 _SOURCE_DEVICE_NAMES = ("voltagesource", "currentsource", "networkanalyzerport")
 
+# Device partname values that mark a statistical noise source (SI's own
+# physically-grounded noise device library -- Johnson/shot/white/etc., see
+# SignalIntegrity/App/Device.py's DeviceVoltageStatisticalNoiseSource /
+# DeviceCurrentStatisticalNoiseSource). Deliberately excludes the 4-port
+# differential-mode/common-mode variants and the '...Project' (hierarchical,
+# noise-pulled-from-another-.si-file) variants -- both are out of scope for
+# now (see schematic/noise.py's module docstring).
+_NOISE_SOURCE_PARTNAMES = (
+    "VoltageStatisticalNoiseSource",
+    "CurrentStatisticalNoiseSource",
+)
+
 _DEFAULT_QUBIT_PROBE_LABEL = "VQubit"
 _DEFAULT_SOURCE_LABEL = "VSource"
 
@@ -84,8 +96,14 @@ class SISchematic:
         guarantees this — it raises otherwise).
     port_names : list of str
         All probe labels in the schematic. This is the set that
-        nonlinear/noise annotation labels are validated against — see
+        nonlinear annotation labels are validated against — see
         validate_node_labels().
+    noise_source_names : list of str
+        All statistical-noise-source device names (refs) in the schematic
+        (see _NOISE_SOURCE_PARTNAMES) — a DIFFERENT namespace than
+        port_names (these are voltagenoisesource/currentnoisesource
+        devices, not Output-type probes). This is the set that `noise`
+        annotation keys are validated against — see validate_node_labels().
     """
     path: Path
     si_app: Any
@@ -93,6 +111,7 @@ class SISchematic:
     source_label: str = _DEFAULT_SOURCE_LABEL
     has_qubit_probe: bool = False
     port_names: list[str] = field(default_factory=list)
+    noise_source_names: list[str] = field(default_factory=list)
 
     def __repr__(self) -> str:
         return (
@@ -176,6 +195,7 @@ def load_schematic(
         raise ValueError(f"Failed to open SignalIntegrity project file: {path}")
 
     port_names = _extract_port_names(app)
+    noise_source_names = _extract_noise_source_names(app)
 
     if qubit_probe_label not in port_names:
         raise ValueError(
@@ -192,6 +212,7 @@ def load_schematic(
         source_label=source_label,
         has_qubit_probe=True,
         port_names=port_names,
+        noise_source_names=noise_source_names,
     )
 
 
@@ -203,6 +224,21 @@ def _extract_port_names(si_app: Any) -> list[str]:
         if partname_prop is None:
             continue
         if partname_prop.GetValue() in _PROBE_PARTNAMES:
+            ref_prop = device["ref"]
+            if ref_prop is not None:
+                names.append(ref_prop.GetValue())
+    return names
+
+
+def _extract_noise_source_names(si_app: Any) -> list[str]:
+    """Return all statistical-noise-source device refs (see
+    _NOISE_SOURCE_PARTNAMES) from the SI schematic."""
+    names = []
+    for device in si_app.Drawing.schematic.deviceList:
+        partname_prop = device["partname"]
+        if partname_prop is None:
+            continue
+        if partname_prop.GetValue() in _NOISE_SOURCE_PARTNAMES:
             ref_prop = device["ref"]
             if ref_prop is not None:
                 names.append(ref_prop.GetValue())
@@ -235,34 +271,39 @@ def validate_node_labels(
     schematic: SISchematic,
     labels: Iterable[str],
     kind: str = "node",
+    known: Iterable[str] | None = None,
 ) -> None:
     """
-    Verify that every label in `labels` names a probe present in the loaded
-    schematic. Called by the engine to check `nonlinear` and `noise`
+    Verify that every label in `labels` names something present in the
+    loaded schematic. Called by the engine to check `nonlinear` and `noise`
     annotation keys before using them (e.g. before building nonlinear node
     models or extracting transfer functions).
 
     Parameters
     ----------
     schematic : SISchematic
-        Loaded schematic; checked against schematic.port_names.
+        Loaded schematic.
     labels : iterable of str
         Annotation keys to validate (e.g. nonlinear.keys() or noise.keys()).
     kind : str
         Human-readable label used in the error message, e.g. 'nonlinear'
         or 'noise' — identifies which annotation dict the bad label came from.
+    known : iterable of str, optional
+        The namespace to validate `labels` against. Defaults to
+        schematic.port_names (the original, probe-label behavior) — pass
+        schematic.noise_source_names for `noise` annotation keys, which name
+        statistical-noise-source devices, a different namespace than probes.
 
     Raises
     ------
     ValueError
-        If any label is not in schematic.port_names. Lists all missing
-        labels and the full set of valid probe names.
+        If any label is not in `known`. Lists all missing labels and the
+        full set of valid names.
     """
-    known = set(schematic.port_names)
-    missing = [label for label in labels if label not in known]
+    known_set = set(known if known is not None else schematic.port_names)
+    missing = [label for label in labels if label not in known_set]
     if missing:
         raise ValueError(
             f"{kind} node(s) {missing} not found in schematic "
-            f"'{schematic.path.name}'. Available probes: "
-            f"{sorted(schematic.port_names)}."
+            f"'{schematic.path.name}'. Available: {sorted(known_set)}."
         )

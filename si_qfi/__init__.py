@@ -20,6 +20,13 @@ Typical usage
 >>> # fid.noise is a NoiseEnsembleFidelity (with .F_avg/.F_std/.propagators/
 >>> # .final_states(), plural) instead of None only if `noise_nodes` above
 >>> # was non-empty -- see quantum/fidelity.py's FidelityResult docstring.
+
+See also: `run(..., phase_noise={...})` for LO/oscillator phase noise (a
+separate, multiplicative mechanism from `noise=`'s additive drive-line
+noise -- see noise/psd.py's phase_noise_psd_from_spec()), and
+`quantum.pulse_snr(result)` for the effective SNR of a noisy result. See
+README.md / INVESTIGATIONS.md for the full feature list and worked
+examples.
 """
 
 from .schematic.loader import load_schematic

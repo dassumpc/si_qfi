@@ -10,6 +10,8 @@ Responsibilities
    coefficients, and demodulate real RF to I/Q for real-axis mode -- hamiltonian.py
 3. Run sesolve (closed) or mesolve (open, with T1/T2), compute gate and/or
    state fidelity -- fidelity.py
+4. Effective SNR of a noisy SimulationResult's ensemble vs. its noise-free
+   signal -- snr.py
 
 This file only re-exports the public API from the submodules above; see
 their module docstrings (in particular fidelity.py's, which has the QuTiP
@@ -25,6 +27,7 @@ from .fidelity import (
     gate_fidelity, apply_channel, ideal_gate_unitary,
     TuneupResult, tuneup_amplitude,
 )
+from .snr import SNRResult, pulse_snr
 
 __all__ = [
     "QubitBase", "QubitModel", "Transmon", "from_scqubits",
@@ -32,4 +35,5 @@ __all__ = [
     "FidelityResult", "SingleFidelity", "NoiseEnsembleFidelity",
     "gate_fidelity", "apply_channel", "ideal_gate_unitary",
     "TuneupResult", "tuneup_amplitude",
+    "SNRResult", "pulse_snr",
 ]

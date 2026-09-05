@@ -134,6 +134,30 @@ class SourceWaveform:
         carrier = np.exp(1j * 2 * np.pi * self.carrier_freq_hz * self._t)
         return np.real(self._values * carrier)
 
+    def resampled_envelope_at(self, fs: float) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Complex envelope ũ(t), resampled (FFT-based, scipy.signal.resample)
+        to an explicit sample rate `fs` -- WITHOUT modulating onto the
+        carrier. Returns (t, envelope_resampled).
+
+        This is the "resample" half of rf_waveform_at(), factored out so a
+        caller can apply a per-realization operation to the envelope BEFORE
+        modulation (e.g. engine.run()'s phase-noise injection, which needs
+        to rotate ũ(t) by exp(j*phi(t)) prior to hitting the carrier --
+        rf_waveform_at() itself has no hook for that). Resampling the
+        complex envelope directly (rather than the already-modulated real
+        RF signal) is safe/robust because the envelope is smooth/
+        band-limited by construction.
+        """
+        if np.isclose(fs, self._fs):
+            return self._t, self._values.copy()
+
+        from scipy.signal import resample
+        n_new = max(int(round(self.n_samples * fs / self._fs)), 1)
+        env_resampled = resample(self._values, n_new)
+        t_new = self._t[0] + np.arange(n_new) / fs
+        return t_new, env_resampled
+
     def rf_waveform_at(self, fs: float) -> tuple[np.ndarray, np.ndarray]:
         """
         Real RF waveform v(t), resampled to an explicit sample rate `fs`
@@ -144,20 +168,8 @@ class SourceWaveform:
         real-axis time resolution (PRD §3.3), so the drive envelope is
         resampled to match it, rather than the transfer function being
         interpolated onto this waveform's own fs.
-
-        Resampling is FFT-based (scipy.signal.resample) on the complex
-        envelope, then modulated onto the carrier at the new rate — this is
-        more robust than resampling the already-modulated real RF signal,
-        since the baseband envelope is smooth/band-limited and safe to
-        resample directly.
         """
-        if np.isclose(fs, self._fs):
-            return self._t, self.rf_waveform
-
-        from scipy.signal import resample
-        n_new = max(int(round(self.n_samples * fs / self._fs)), 1)
-        env_resampled = resample(self._values, n_new)
-        t_new = self._t[0] + np.arange(n_new) / fs
+        t_new, env_resampled = self.resampled_envelope_at(fs)
         carrier = np.exp(1j * 2 * np.pi * self.carrier_freq_hz * t_new)
         return t_new, np.real(env_resampled * carrier)
 
