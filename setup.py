@@ -1,23 +1,11 @@
 """
 SI-QFI: Signal Integrity Quantum Fidelity Impact Plugin
-"""
-from setuptools import setup, find_packages
 
-setup(
-    name="si_qfi",
-    version="0.1.0-dev",
-    description="Bridges SignalIntegrity drive-chain simulation with QuTiP gate fidelity analysis",
-    packages=find_packages(),
-    python_requires=">=3.9",
-    install_requires=[
-        "numpy>=1.24",
-        "scipy>=1.10",
-        "matplotlib>=3.7",
-    ],
-    extras_require={
-        "quantum": ["qutip>=5.0"],
-        "qubits": ["scqubits>=4.0"],
-        "si": ["SignalIntegrity"],
-        "dev": ["pytest", "pytest-cov"],
-    },
-)
+Shim only. All package metadata (name, version, dependencies, extras) now
+lives in pyproject.toml -- this file exists so `python setup.py ...` and
+older tooling keep working, and deliberately declares nothing itself so the
+two can never drift out of sync.
+"""
+from setuptools import setup
+
+setup()

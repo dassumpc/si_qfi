@@ -9,6 +9,9 @@ Supported model strings
   'saleh'      → SalehModel (mode='complex_baseband') or SalehRealAxisModel
                  (mode='real_axis') -- see nonlinear/saleh.py.
   'volterra'   → VolterraModel
+  'table'      → TabulatedModel -- generic AM-AM/AM-PM interpolated from a
+                 caller-supplied amplitude table, supports both modes. See
+                 nonlinear/tabulated.py.
 
 All keys that are not recognised model parameters are passed through as kwargs
 to the model constructor so that future models can add their own parameters
@@ -41,6 +44,7 @@ import numpy as np
 from .base import NonlinearNode
 from .saleh import SalehModel, SalehRealAxisModel
 from .volterra import VolterraModel
+from .tabulated import TabulatedModel
 
 _SMALL_SIGNAL_GAIN_TOLERANCE_DB = 1.0
 
@@ -128,10 +132,12 @@ def _build_model(
         node = _build_saleh(params, mode)
     elif model_name == "volterra":
         node = _build_volterra(params)
+    elif model_name == "table":
+        node = _build_table(params)
     else:
         raise ValueError(
             f"Unknown nonlinear model '{model_name}' for node '{label}'. "
-            f"Supported: 'saleh', 'volterra'."
+            f"Supported: 'saleh', 'volterra', 'table'."
         )
 
     # Validate mode compatibility
@@ -178,6 +184,14 @@ def _build_saleh(p: dict, mode: str):
         beta_a=p["beta_a"],
         alpha_phi=p.get("alpha_phi", 0.0),
         beta_phi=p.get("beta_phi", 0.0),
+    )
+
+
+def _build_table(p: dict) -> TabulatedModel:
+    return TabulatedModel(
+        amplitude=p["amplitude"],
+        output_amplitude=p["output_amplitude"],
+        phase_rad=p.get("phase_rad"),
     )
 
 

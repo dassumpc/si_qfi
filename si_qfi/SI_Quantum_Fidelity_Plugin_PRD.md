@@ -1,14 +1,40 @@
 # SI-QFI: Signal Integrity Quantum Fidelity Impact Plugin
-### Project Definition Document v0.17
+### Design specification and derivations (originally "Project Definition Document v0.17")
 
 ---
 
-**See `INVESTIGATIONS.md` at the repo root for a running log of physics
-investigations built on top of this design** (nonlinearity vs. gate
-fidelity, bandwidth/dispersion, impedance mismatch/reflections) — useful as
-worked examples of the design principles below in practice, and as evidence
-of which parts of this spec are implemented vs. still aspirational. See
-`SI_QFI_Cursor_Handoff.md` for exact implementation status.
+## How to read this document
+
+This is the **design specification**: the math behind the two simulation
+modes, the derivations behind the nonlinearity models, and the reasoning
+behind the noise-injection architecture. It is kept because the code cites
+it heavily — roughly 44 docstring references point at section numbers here
+(§3.6's gain convention alone is cited about a dozen times across
+`nonlinear/`, and is quoted in a runtime warning users can actually see), so
+the section numbering is a stable API of its own and does not get
+renumbered.
+
+**Where this document and the code disagree, the code is correct.** This was
+written as a forward-looking spec, and implementation refined several
+decisions after the fact. Two consequences worth stating plainly:
+
+- **§7.1's Johnson-noise formula is wrong and was never implemented.** It
+  writes `S_v = k_B * T_eff * R_source`; the correct, implemented form is
+  `S_v = 4 * k_B * T * R`. See the inline correction at that section, and
+  `noise/psd.py`'s module docstring, which documents the discrepancy and
+  cross-checks the implemented version against SignalIntegrity's own native
+  computation.
+- **§10's file layout has been updated to match the shipped package.** Where
+  this spec originally proposed a module that was later folded into another
+  file (or not built at all), that is now noted there rather than listed as
+  though it exists. The `sweep/` package it once proposed does not exist and
+  ships no stub.
+
+For what is actually implemented and how, see the top-level `README.md`
+(feature list, runnable example) and `SI_QFI_Cursor_Handoff.md`
+(implementation status, exact SignalIntegrity/QuTiP API resolutions). For
+the physics this design has been used to investigate — and several real bugs
+found along the way — see `INVESTIGATIONS.md` alongside this file.
 
 ---
 
@@ -467,8 +493,18 @@ propagated independently to the qubit plane:
 
 ```python
 # PSD from noise specification
-S_v_j(f) = k_B * T_eff * R_source        # noise figure spec
-T_eff = T_phys * (10**(NF_dB/10) - 1)   # excess noise temperature
+# CORRECTED. This section originally read `S_v_j(f) = k_B * T_eff * R_source`,
+# which is too small by a factor of 4 and was NEVER implemented that way.
+# The implemented (and correct) Johnson-noise form is 4*k_B*T*R -- the same
+# convention SignalIntegrity's own native noise computation uses, verified in
+# tests/test_engine_noise.py::test_johnson_psd_matches_4kTR_formula. Had the
+# original line been implemented, every noise-figure-derived PSD would have
+# been undersized by exactly 4x relative to every other noise source in the
+# codebase. See noise/psd.py's module docstring.
+S_v_j(f) = 4 * k_B * T_eff * R_source    # noise figure spec
+T_eff = T_ref * (10**(NF_dB/10) - 1)    # excess noise temperature;
+                                        # T_ref = 290 K (IEEE reference T0),
+                                        # not the device's physical temperature
 
 # One noise realization at node j
 noise_fft = np.sqrt(S_v_j(freqs) * df) * (randn(N) + 1j*randn(N))
@@ -499,7 +535,10 @@ noise_nodes = {
     "NL_AMP1_OUT": {
         "type": "noise_figure",
         "noise_figure_db": 3.0,
-        "temperature_k": 300.0,
+        # temperature_k is OPTIONAL here and defaults to 290 K -- the IEEE
+        # noise-figure reference temperature T0, NOT the device's physical
+        # operating temperature. Override it only if the figure was
+        # specified against a non-standard reference.
     },
     "CRYO_INPUT": {
         "type": "noise_density",
@@ -740,13 +779,21 @@ F_i       = qt.average_gate_fidelity(U_actual, U_ideal)
 
 ## 10. Module Structure
 
+This is the **as-built** layout. Several modules this spec originally
+proposed were folded into neighbouring files during implementation rather
+than shipped separately; those are noted inline rather than listed as if
+they exist. The top-level `README.md` carries the same tree with one-line
+descriptions, and each subpackage has its own `README.md`.
+
 ```
 si_qfi/
 ├── schematic/
-│   ├── loader.py              # Load and validate SI schematic
-│   ├── transfer_function.py   # Extract H_k(ω) between probe pairs
-│   ├── topology.py            # Determine NL node propagation order
-│   └── checks.py              # Isolation, harmonic suppression, inter-stage checks
+│   ├── loader.py              # Load and validate SI schematic, incl. <Variables> overrides
+│   ├── transfer_function.py   # Extract H_k(ω) between probe pairs; impulse response per mode
+│   └── noise.py               # SI statistical-noise-source PSD + its transfer function
+│                              # (proposed topology.py / checks.py were not built separately:
+│                              #  NL propagation order and the isolation / harmonic-suppression
+│                              #  checks both live in simulation/engine.py)
 │
 ├── source/
 │   └── waveform.py            # SourceWaveform: carrier + SI Waveform → modulated signal
@@ -755,40 +802,47 @@ si_qfi/
 │   ├── base.py                # NonlinearNode base class
 │   ├── saleh.py               # SalehModel (complex baseband) + SalehRealAxisModel (real-axis)
 │   ├── volterra.py            # Volterra series, real-axis mode only
-│   └── registry.py            # Map NL probe label → model
+│   ├── tabulated.py           # TabulatedModel: generic AM-AM/AM-PM from a caller-supplied table
+│   └── registry.py            # Map NL probe label → model; small-signal-gain check (§3.6)
 │
 ├── noise/
-│   ├── annotation.py          # Parse noise_nodes dict
-│   ├── psd.py                 # S_v(f) from noise figure / temperature / density
-│   ├── realization.py         # Bandlimited Gaussian noise realization from S_v(f)
-│   └── propagation.py         # Precompute h_{j→qubit} per noise node; propagate realizations independently
+│   ├── psd.py                 # S_v(f) from noise figure / temperature / density / colored
+│   │                          # override, plus phase-noise PSD specs
+│   │                          # (proposed annotation.py was not built: parsing the noise dict
+│   │                          #  is part of psd.py)
+│   ├── realization.py         # Bandlimited Gaussian noise realization from S_v(f); phase noise
+│   └── propagation.py         # Precompute h_{j→qubit} per noise node; propagate independently
 │
 ├── simulation/
-│   ├── engine.py              # Two-pass main loop: NL pass (deterministic) + noise pass (stochastic)
-│   ├── ensemble.py            # N realizations → F_avg, F_std, F_sem
-│   └── diagnostics.py         # All runtime warnings and checks
+│   └── engine.py              # Two-pass main loop: NL pass (deterministic) + noise pass
+│                              # (stochastic); phase-noise injection; compare_modes()
+│                              # (proposed ensemble.py / diagnostics.py were not built
+│                              #  separately: ensemble statistics live in quantum/fidelity.py,
+│                              #  and all runtime warnings/checks live here)
 │
 ├── quantum/
-│   ├── qubit_model.py         # H0: scqubits, manual, analytic transmon
-│   ├── hamiltonian.py         # QobjEvo H(t) from I/Q envelope arrays
-│   ├── demodulation.py        # Demodulate real v_qubit(t) → I/Q for real-axis mode
-│   └── fidelity.py            # propagator + average_gate_fidelity per realization
-│
-├── sweep/
-│   ├── parameter_sweep.py     # Fidelity vs. schematic or annotation parameter
-│   └── budget.py              # Per-impairment fidelity budget
+│   ├── models.py              # H0: scqubits, manual, analytic transmon (spec'd as qubit_model.py)
+│   ├── hamiltonian.py         # QobjEvo H(t) from I/Q envelope arrays, plus demodulate()
+│   │                          # (proposed demodulation.py was folded in here)
+│   ├── fidelity.py            # propagator + average_gate_fidelity per realization; ensemble
+│   │                          # statistics; tuneup_amplitude()
+│   └── snr.py                 # pulse_snr(): effective SNR of a noisy result
 │
 ├── output/
-│   ├── plots.py               # Waveform, noise, fidelity distribution, sweep plots
-│   └── report.py              # Summary: F_avg, F_std, warnings, budget
+│   └── __init__.py            # plot_waveform(), plot_nonlinearity()
+│                              # (proposed plots.py / report.py split was not built; the richer
+│                              #  report generation of §12 remains unimplemented)
 │
-└── examples/
-    ├── single_qubit_coax.py
-    ├── amplifier_compression_baseband.py
-    ├── amplifier_compression_realaxis.py    # Cross-validation example
-    ├── two_qubit_crosstalk.py
-    └── drag_pulse_dispersion.py
+└── examples/                  # One runnable demo per INVESTIGATIONS.md section
+                               # (the illustrative filenames this spec originally listed were
+                               #  superseded by the actual investigation demos; see
+                               #  INVESTIGATIONS.md for the current set)
 ```
+
+**Not built.** The `sweep/` package proposed by earlier drafts (parameter
+sweeps and per-impairment fidelity budgets, §12) does not exist and no stub
+ships for it. Parameter sweeps today are written as plain loops over
+`siq.run()` — see `examples/noise_density_sweep_demo.py` for a worked one.
 
 ---
 
@@ -882,8 +936,10 @@ if fidelity_result.noise is not None:
     print(f"Ensemble gate fidelity:   {fidelity_result.noise.F_avg:.5f} "
           f"± {fidelity_result.noise.F_sem:.6f}  (N={fidelity_result.noise.n_realizations})")
 siq.output.plot_waveform(result)
-# Fidelity budget decomposition (siq.sweep.budget) is a Phase 3 feature, not
-# yet implemented -- see §13.
+# Fidelity budget decomposition is NOT implemented and no siq.sweep package
+# ships -- see §10's "Not built" note. To budget contributions today, run
+# siq.run() with and without each impairment enabled and compare; every
+# investigation in INVESTIGATIONS.md does exactly that.
 
 # 7. Calibration helper: tuneup_amplitude() searches an amplitude scale
 # factor for a reference envelope shape to maximize the requested fidelity
@@ -952,14 +1008,32 @@ siq.compare_modes(result, result_real)   # Warns if modes disagree beyond tolera
 - Lindblad secondary mode (T1/T2)
 - Cross-validation utility: compare_modes()
 
-### Phase 3 — Multi-Qubit and Analysis
-- Multi-probe crosstalk schematics
-- scqubits integration
-- Fidelity budget decomposition
-- Parameter sweeps
-- Example notebooks
-- Oscillator phase noise (§7.4) — Monte Carlo over the nonlinear pass, one full NL
-  evaluation per realization
+### Phase 3 — Multi-Qubit and Analysis (partially complete)
+
+Phases 1 and 2 above are done. Phase 3 was never completed as a unit; its
+current status, item by item:
+
+- **Oscillator phase noise (§7.4)** — ✅ done. Monte Carlo over the nonlinear
+  pass, one full NL evaluation per realization, exactly as specified here.
+  See `noise/psd.py`'s `phase_noise_psd_from_spec()`, `engine.run()`'s
+  `phase_noise=` parameter, and Investigation 10 in `INVESTIGATIONS.md`.
+- **Example notebooks** — ✅ done, though as `examples/` scripts (one per
+  investigation) plus two standalone derivation notebooks in `notebooks/`,
+  rather than as notebooks throughout.
+- **scqubits integration** — ⚠️ written but unverified. `from_scqubits()`
+  exists in `quantum/models.py` and has never been exercised against a real
+  scqubits install; its own docstring says so.
+- **Fidelity budget decomposition** — 🔲 not built. No `sweep/` package
+  ships (see §10). Budget contributions by running with and without each
+  impairment and comparing.
+- **Parameter sweeps** — 🔲 not built as a utility. Written as plain loops
+  over `siq.run()`; see `examples/noise_density_sweep_demo.py`.
+- **Multi-probe crosstalk schematics** — 🔲 not built.
+
+Two capabilities were added that this spec never anticipated: `pulse_snr()`
+(`quantum/snr.py`), and `TabulatedModel` (`nonlinear/tabulated.py`), a
+generic table-driven AM-AM/AM-PM model for devices whose response fits
+neither the Saleh nor Volterra functional form.
 
 ---
 

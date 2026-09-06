@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# SignalIntegrity auto-generated transfer-matrix caches (regenerated on demand,
+# byte-identical; pickles, ~12MB, and they churn on every test run)
+*_cachedTransferMatrices.p
+
+# Editor workspace files
+*.code-workspace

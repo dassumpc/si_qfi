@@ -40,6 +40,8 @@ import numpy as np
 import pytest
 from si_qfi.nonlinear.saleh import SalehModel, SalehRealAxisModel
 from si_qfi.nonlinear.volterra import VolterraModel
+from si_qfi.nonlinear.tabulated import TabulatedModel
+from si_qfi.nonlinear.registry import build_nonlinear_nodes
 
 _ONE_DB_RATIO = 10 ** (-1.0 / 20.0)   # ~0.891250938; 20*log10(this) == -1 exactly
 
@@ -620,6 +622,215 @@ class TestVolterraModel:
         op1db_in = 1.0   # op1db / _ONE_DB_RATIO == 1.0 by construction
         output_at_op1db = v.apply_real_axis(np.array([op1db_in]))[0]
         assert output_at_op1db == pytest.approx(op1db)
+
+
+class TestTabulatedModel:
+
+    # -- construction validation ---------------------------------------
+
+    def test_requires_table_start_at_origin_amplitude(self):
+        with pytest.raises(ValueError, match="start at exactly"):
+            TabulatedModel(amplitude=[0.1, 1.0], output_amplitude=[0.0, 0.9])
+
+    def test_requires_table_start_at_origin_output(self):
+        with pytest.raises(ValueError, match="start at exactly"):
+            TabulatedModel(amplitude=[0.0, 1.0], output_amplitude=[0.05, 0.9])
+
+    def test_requires_matching_lengths(self):
+        with pytest.raises(ValueError, match="same length"):
+            TabulatedModel(amplitude=[0.0, 0.5, 1.0], output_amplitude=[0.0, 0.9])
+
+    def test_requires_at_least_two_points(self):
+        with pytest.raises(ValueError, match="at least 2 points"):
+            TabulatedModel(amplitude=[0.0], output_amplitude=[0.0])
+
+    def test_requires_strictly_ascending_amplitude(self):
+        with pytest.raises(ValueError, match="strictly ascending"):
+            TabulatedModel(amplitude=[0.0, 1.0, 1.0], output_amplitude=[0.0, 0.9, 0.95])
+
+    def test_phase_rad_length_mismatch_rejected(self):
+        with pytest.raises(ValueError, match="same length as amplitude"):
+            TabulatedModel(
+                amplitude=[0.0, 1.0], output_amplitude=[0.0, 0.9], phase_rad=[0.0]
+            )
+
+    # -- baseband ---------------------------------------------------------
+
+    def test_baseband_exact_at_table_points(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 1.0, 2.0], output_amplitude=[0.0, 0.9, 1.5]
+        )
+        u = np.array([1.0 + 0j, 2.0 + 0j])
+        out = model.apply_baseband(u)
+        assert np.abs(out[0]) == pytest.approx(0.9)
+        assert np.abs(out[1]) == pytest.approx(1.5)
+
+    def test_baseband_linear_interpolation_between_points(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 1.0, 2.0], output_amplitude=[0.0, 0.9, 1.5]
+        )
+        u = np.array([1.5 + 0j])
+        out = model.apply_baseband(u)
+        assert np.abs(out[0]) == pytest.approx((0.9 + 1.5) / 2)
+
+    def test_baseband_preserves_phasor_direction_when_no_am_pm(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 1.0, 2.0], output_amplitude=[0.0, 0.9, 1.5]
+        )
+        u = np.array([1j * 1.0])   # pure +j phasor, amplitude 1.0
+        out = model.apply_baseband(u)
+        assert out[0] == pytest.approx(0.9j)
+
+    def test_baseband_am_pm_applied(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 1.0, 2.0],
+            output_amplitude=[0.0, 0.9, 1.5],
+            phase_rad=[0.0, 0.2, 0.5],
+        )
+        u = np.array([1.0 + 0j])
+        out = model.apply_baseband(u)
+        expected = 0.9 * np.exp(1j * 0.2)
+        assert out[0] == pytest.approx(expected)
+
+    def test_baseband_zero_amplitude_safe(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 1.0], output_amplitude=[0.0, 0.9]
+        )
+        out = model.apply_baseband(np.array([0.0 + 0j]))
+        assert out[0] == pytest.approx(0.0)
+
+    # -- real-axis ----------------------------------------------------------
+
+    def test_real_axis_matches_baseband_magnitude_at_table_points(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 1.0, 2.0], output_amplitude=[0.0, 0.9, 1.5]
+        )
+        out = model.apply_real_axis(np.array([1.0, 2.0]))
+        assert out[0] == pytest.approx(0.9)
+        assert out[1] == pytest.approx(1.5)
+
+    def test_real_axis_odd_symmetry(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 1.0, 2.0], output_amplitude=[0.0, 0.9, 1.5]
+        )
+        pos = model.apply_real_axis(np.array([0.5, 1.5]))
+        neg = model.apply_real_axis(np.array([-0.5, -1.5]))
+        assert neg == pytest.approx(-pos)
+
+    def test_real_axis_ignores_am_pm_table_without_error(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 1.0], output_amplitude=[0.0, 0.9], phase_rad=[0.0, 0.5]
+        )
+        out = model.apply_real_axis(np.array([1.0]))
+        assert out[0] == pytest.approx(0.9)
+
+    # -- extrapolation warning -----------------------------------------------
+
+    def test_warns_when_peak_exceeds_table_range(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 1.0], output_amplitude=[0.0, 0.9]
+        )
+        with pytest.warns(UserWarning, match="calibrated range"):
+            model.apply_baseband(np.array([2.0 + 0j]))
+
+    def test_no_warning_within_table_range(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 1.0], output_amplitude=[0.0, 0.9]
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            model.apply_baseband(np.array([0.9 + 0j]))   # should not raise
+
+    # -- non-monotonic table (the motivating AOM use case) -------------------
+
+    def test_non_monotonic_table_not_rejected(self):
+        """
+        An AOM's RF-power-to-diffracted-amplitude response is sinusoidal
+        (A_out = sin(kappa*A_in)) and genuinely turns over past its first
+        diffraction maximum -- unlike Saleh/Volterra's max_monotonic_amplitude
+        checks, TabulatedModel must not flag or misreport this: it's a
+        legitimate, intentional table shape, not an overdrive bug signal.
+        """
+        kappa = np.pi / 2.0   # turnover (peak) at amplitude = 1.0
+        amp = np.linspace(0.0, 2.0, 41)
+        out_amp = np.sin(kappa * amp)
+        model = TabulatedModel(amplitude=amp, output_amplitude=out_amp)
+
+        peak_output = model.apply_real_axis(np.array([1.0]))[0]
+        past_turnover_output = model.apply_real_axis(np.array([1.8]))[0]
+        assert past_turnover_output < peak_output, (
+            "Table must faithfully reproduce the turnover, not just the "
+            "monotonic rising part."
+        )
+        # No warning should fire -- 1.8 is within the table's own range.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            model.apply_real_axis(np.array([1.8]))
+
+    # -- small_signal_gain / gain-convention warning -------------------------
+
+    def test_small_signal_gain_matches_second_point_ratio(self):
+        model = TabulatedModel(
+            amplitude=[0.0, 0.5, 2.0], output_amplitude=[0.0, 0.45, 1.5]
+        )
+        assert model.small_signal_gain == pytest.approx(0.9)
+
+    def test_registry_warns_on_off_unity_small_signal_gain(self):
+        annotation = {
+            "NL1": {
+                "model": "table",
+                "amplitude": [0.0, 0.5, 2.0],
+                "output_amplitude": [0.0, 0.6, 1.5],   # gain ~1.2 at small signal
+            }
+        }
+        warnings_list = []
+        build_nonlinear_nodes(annotation, mode="complex_baseband", warnings_list=warnings_list)
+        assert any("small-signal gain" in w for w in warnings_list)
+
+    # -- registry integration ------------------------------------------------
+
+    def test_registry_builds_table_model_baseband(self):
+        annotation = {
+            "NL1": {
+                "model": "table",
+                "amplitude": [0.0, 1.0, 2.0],
+                "output_amplitude": [0.0, 0.9, 1.5],
+            }
+        }
+        nodes = build_nonlinear_nodes(annotation, mode="complex_baseband")
+        assert isinstance(nodes["NL1"], TabulatedModel)
+        out = nodes["NL1"].apply_baseband(np.array([1.0 + 0j]))
+        assert np.abs(out[0]) == pytest.approx(0.9)
+
+    def test_registry_builds_table_model_real_axis(self):
+        annotation = {
+            "NL1": {
+                "model": "table",
+                "amplitude": [0.0, 1.0, 2.0],
+                "output_amplitude": [0.0, 0.9, 1.5],
+            }
+        }
+        nodes = build_nonlinear_nodes(annotation, mode="real_axis")
+        assert isinstance(nodes["NL1"], TabulatedModel)
+        out = nodes["NL1"].apply_real_axis(np.array([1.0]))
+        assert out[0] == pytest.approx(0.9)
+
+    def test_registry_builds_table_model_real_axis_out_of_order(self):
+        annotation = {
+            "NL1": {
+                "model": "table",
+                "amplitude": [0.0, 2.0, 1.0],
+                "output_amplitude": [0.0, 1.5, 0.9],
+            }
+        }
+        with pytest.raises(ValueError):
+            build_nonlinear_nodes(annotation, mode="real_axis")
+
+
+    def test_registry_rejects_unknown_model_mentions_table(self):
+        annotation = {"NL1": {"model": "not_a_model"}}
+        with pytest.raises(ValueError, match="'table'"):
+            build_nonlinear_nodes(annotation, mode="complex_baseband")
 
 
 if __name__ == "__main__":

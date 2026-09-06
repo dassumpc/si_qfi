@@ -15,7 +15,7 @@ Drop both this file and the PRD into your Cursor project context.
 **Status: all three Cursor tasks below are done.** The SI↔QuTiP bridge is
 fully wired up, tested, and has been used to run a series of physics
 investigations (nonlinearity, dispersion, impedance mismatch) documented in
-`INVESTIGATIONS.md` at the repo root — that file is the best evidence the
+`INVESTIGATIONS.md` (alongside this file) — that file is the best evidence the
 integration actually works end-to-end, and is worth reading alongside this
 document for how the pieces below get used in practice.
 
@@ -24,10 +24,16 @@ document for how the pieces below get used in practice.
 ## Repository Structure
 
 ```
-si_qfi/
+.                                     repo root
 ├── README.md                         Quick-start and structure overview
-├── setup.py                          Package metadata and dependencies
+├── LICENSE                           MIT (note: SignalIntegrity itself is GPLv3+)
+├── pyproject.toml                    Package metadata and dependencies
+├── setup.py                          Shim; metadata lives in pyproject.toml
+│
+si_qfi/                               the importable package
 ├── SI_Quantum_Fidelity_Plugin_PRD.md Full design specification
+├── SI_QFI_Cursor_Handoff.md          This file
+├── INVESTIGATIONS.md                 Physics findings log
 │
 ├── __init__.py                       ✅ Top-level API: load_schematic, SourceWaveform, run
 │
@@ -65,10 +71,12 @@ si_qfi/
 │                                         tuneup_amplitude(), T1/T2 Lindblad
 │
 ├── output/
-│   └── __init__.py                   🔲 Phase 3 stub
+│   └── __init__.py                   ✅ plot_waveform(), plot_nonlinearity()
+│                                         (richer report generation still 🔲)
 │
-├── sweep/
-│   └── __init__.py                   🔲 Phase 3 stub
+│   (no sweep/ package — parameter sweeps are still written as plain loops
+│    over siq.run(); see examples/noise_density_sweep_demo.py. The PRD's
+│    planned sweep/ layer is 🔲 unbuilt, and no stub is shipped for it.)
 │
 ├── examples/                         ✅ Runnable investigation demos (one per INVESTIGATIONS.md section)
 ├── INVESTIGATIONS.md                 ✅ Running report log of physics findings
@@ -506,12 +514,24 @@ pip install scqubits
   install. Everything else in this codebase uses the analytic `Transmon`/
   `QubitModel` classes instead, which are fully verified.
 
-**Phase 3 (not started):**
+**Phase 3 (partially complete — see PRD §13 for the same list with status):**
+
+Done since this section was written:
+- Oscillator phase noise — `phase_noise=` on `engine.run()`, injected before
+  the nonlinear pass (Investigation 10)
+- Example demos and derivation notebooks — `examples/`, `notebooks/`
+- `pulse_snr()` (`quantum/snr.py`) and `TabulatedModel`
+  (`nonlinear/tabulated.py`), neither of which the PRD anticipated
+
+Still not built (no stub ships for any of these — the proposed `sweep/`
+package does not exist):
 - Multi-probe schematics (crosstalk analysis)
-- Parameter sweep utilities (`sweep/parameter_sweep.py`)
-- Fidelity budget decomposition (`sweep/budget.py`)
-- Full output/plotting module (`output/plots.py`, `output/report.py`)
-- Example notebooks
+- Parameter sweep utilities — write plain loops over `siq.run()` instead;
+  see `examples/noise_density_sweep_demo.py`
+- Fidelity budget decomposition — run with and without each impairment and
+  compare
+- Richer report generation on top of `output/`'s existing `plot_waveform()`
+  / `plot_nonlinearity()`
 
 ---
 

@@ -25,25 +25,23 @@ See also: `run(..., phase_noise={...})` for LO/oscillator phase noise (a
 separate, multiplicative mechanism from `noise=`'s additive drive-line
 noise -- see noise/psd.py's phase_noise_psd_from_spec()), and
 `quantum.pulse_snr(result)` for the effective SNR of a noisy result. See
-README.md / INVESTIGATIONS.md for the full feature list and worked
-examples.
+README.md (at the repo root) / INVESTIGATIONS.md (in this package
+directory) for the full feature list and worked examples.
 """
 
 from .schematic.loader import load_schematic
 from .source.waveform import SourceWaveform
 from .simulation.engine import run
 from . import quantum
-from . import sweep
 from . import output
 from .simulation.engine import compare_modes
 
-__version__ = "0.1.0-dev"
+__version__ = "0.1.0.dev0"   # keep in sync with pyproject.toml's [project] version
 __all__ = [
     "load_schematic",
     "SourceWaveform",
     "run",
     "quantum",
-    "sweep",
     "output",
     "compare_modes",
 ]

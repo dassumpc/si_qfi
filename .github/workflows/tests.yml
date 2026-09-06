@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The backend-free tier: nonlinear/noise/PSD/waveform unit tests need only
+  # numpy+scipy. Fast, and runs across the full supported Python range.
+  unit:
+    name: unit tests (no SI/QuTiP) · py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (no optional backends)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run tests
+        # Tests needing SignalIntegrity/QuTiP importorskip themselves, so
+        # they are reported as skipped rather than failing here.
+        run: pytest si_qfi/tests/ -q
+
+  # The full tier: adds QuTiP so the quantum/engine integration tests run.
+  # SignalIntegrity is not on PyPI under a pip-installable name that works
+  # unattended, so schematic-backed tests still skip here -- see
+  # si_qfi/SI_QFI_Cursor_Handoff.md for how it is installed locally.
+  with-qutip:
+    name: unit + QuTiP tests · py3.11
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install with the quantum extra
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[quantum,dev]"
+      - name: Run tests
+        run: pytest si_qfi/tests/ -q

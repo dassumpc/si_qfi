@@ -133,7 +133,11 @@ def load_schematic(
     Parameters
     ----------
     path : str or Path
-        Path to the .si schematic file.
+        Path to the .si schematic file. Relative paths are accepted and
+        resolved to absolute internally -- SignalIntegrity's own
+        OpenProjectFile() silently fails (returns False, no exception) on a
+        relative path, so passing one straight through would raise a
+        misleading "failed to open" error for a file that plainly exists.
     qubit_probe_label : str
         Label of the probe that marks the qubit plane. Default 'VQubit'.
     source_label : str
@@ -176,7 +180,11 @@ def load_schematic(
         device).
     ImportError : if SignalIntegrity is not installed.
     """
-    path = Path(path)
+    # .resolve() is load-bearing, not cosmetic: SignalIntegrity's
+    # OpenProjectFile() returns False (no exception) for a relative path,
+    # which would surface below as a confusing "failed to open" on a file
+    # that exists. See the `path` parameter's docstring.
+    path = Path(path).resolve()
     if not path.exists():
         raise FileNotFoundError(f"Schematic not found: {path}")
 

@@ -453,5 +453,25 @@ def test_compute_impulse_response_baseband_low_fs_lossy_line(lossy_si_app, low_f
     assert np.isclose(np.max(np.abs(v_out)), np.abs(h_at_carrier) * np.max(np.abs(v_in)), rtol=1e-2)
 
 
+def test_load_schematic_accepts_relative_path(monkeypatch):
+    """
+    Regression test: load_schematic() must accept a RELATIVE path.
+
+    SignalIntegrity's own OpenProjectFile() silently returns False (no
+    exception) when handed a relative path, so an earlier version of
+    load_schematic() -- which passed the caller's path straight through --
+    raised a misleading "Failed to open SignalIntegrity project file" for a
+    file that plainly existed. Every other test and example in this repo
+    pre-resolves its path via Path(__file__).parent/... .resolve(), so the
+    whole suite worked around the bug and never caught it; the README's own
+    quick-usage example (a relative path) did not, and failed for any new
+    user who copied it. loader.load_schematic() now .resolve()s internally.
+    """
+    monkeypatch.chdir(SCHEMATIC_PATH.parent)
+    schematic = si_loader.load_schematic(SCHEMATIC_PATH.name)   # bare relative name
+    assert schematic.path.is_absolute()
+    assert _EXPECTED_PROBES.issubset(set(schematic.port_names))
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

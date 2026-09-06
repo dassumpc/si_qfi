@@ -1,4 +1,12 @@
-"""si_qfi.output — plotting and report stubs (Phase 3)."""
+"""
+si_qfi.output — plotting helpers.
+
+Two working utilities live here: plot_waveform() (the qubit-plane waveform
+for one realization) and plot_nonlinearity() (a NonlinearNode's swept
+input/output curve, for eyeballing a model's shape and compression before
+committing to a full simulation). The richer full-report generation
+described in the PRD is not built yet.
+"""
 
 def plot_waveform(result, realization_idx=0):
     """Plot the qubit-plane waveform for one realization."""

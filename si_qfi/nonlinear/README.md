@@ -16,6 +16,10 @@ derivation of why, and `registry.py`'s small-signal-gain runtime check).
   parameterizations: `describing` (from a single OP1dB/OIP3 point, the
   cubic-kernel describing-function result), `diagonal` (caller-supplied
   per-tap coefficients), `full_kernel` (a full 3-tap Volterra series).
+- **`tabulated.py`** — `TabulatedModel` (both modes), a generic AM-AM/AM-PM
+  nonlinearity interpolated directly from a caller-supplied amplitude table,
+  for devices whose response doesn't fit Saleh's or Volterra's functional
+  form (e.g. an AOM's sinusoidal, non-monotonic diffraction response).
 - **`registry.py`** — parses the `nonlinear={...}` annotation dict into
   `NonlinearNode` objects, dispatched by mode; runs the small-signal-gain
   deviation check.
